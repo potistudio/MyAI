@@ -76,7 +76,7 @@ struct TrainConfig {
 	// 毎 step 重みを (1 - lr * weight_decay) 倍に縮め、大きな重みに頼った丸暗記を抑える。
 	// 1 次元の bias と LayerNorm には掛けない（ParamGroups 参照）
 	weight_decay: f64,
-	// 勾配全体の L2 ノルムがこの値を超えたら、向きを保ったままこの長さまで縮める。0 で無効。
+	// 勾配全体の L2 ノルムがこの値を超えたら、向きを保ったままこの長さまで縮める。0 で縮めない（ノルムが inf や NaN なら 0 でも止める）。
 	// AdamW は勾配を自身の大きさの移動平均で割るので、1 step の更新幅はもともと lr 程度に収まり、
 	// 毎 step 同じ倍率で縮めても更新は変わらない。効くのは突発的に大きい勾配が出た step で、
 	// その 1 回が 1 次・2 次モーメントの移動平均を大きく塗り替え、2 次モーメントが長く膨らんだまま
@@ -526,7 +526,7 @@ fn clip_grad_norm(grads: &mut GradStore, vars: &[Tensor], max_norm: f64) -> Resu
 	// NaN は大小比較が常に偽でクリップを素通りし、AdamW が全重みとモーメントを NaN で上書きする。
 	// その後は最終 step まで NaN のまま計算が続くだけなので、ここで止める
 	if !norm.is_finite() {
-		candle_core::bail!("勾配ノルムが有限の値でない: {norm}");
+		candle_core::bail!("勾配ノルムが有限の値でない（勾配に NaN か inf があるか、二乗和が f32 であふれた）: {norm}");
 	}
 	if max_norm > 0.0 && norm as f64 > max_norm {
 		let scale = max_norm / norm as f64;
@@ -748,9 +748,6 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		cfg.max_steps = steps;
 	}
 	if let Some(p) = args.dropout {
-		if !(0.0..1.0).contains(&p) {
-			candle_core::bail!("--dropout は 0 以上 1 未満である必要がある: {p}");
-		}
 		cfg.dropout = p;
 	}
 	if let Some(wd) = args.weight_decay {
@@ -759,19 +756,22 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	if let Some(c) = args.grad_clip {
 		cfg.grad_clip = c;
 	}
-	// 既定値を書き換えたときにも同じ条件で弾けるよう、指定の有無にかかわらず確かめる。
+	// 既定値を書き換えたときにも同じ条件で弾けるよう、指定の有無にかかわらず確かめる
+	if !(0.0..1.0).contains(&cfg.dropout) {
+		candle_core::bail!("--dropout は 0 以上 1 未満である必要がある: {}", cfg.dropout);
+	}
 	// 重みは毎 step (1 - lr * weight_decay) 倍されるので、負だと膨らみ続け、lr * weight_decay が 1 以上だと
 	// 1 step で 0 か符号反転になり、inf や NaN だと全重みが NaN になる
 	if !(cfg.weight_decay >= 0.0 && cfg.weight_decay * cfg.lr < 1.0) {
 		candle_core::bail!(
-			"weight_decay は 0 以上で、lr ({}) との積が 1 未満である必要がある: {}",
+			"--weight-decay は 0 以上で、lr ({}) との積が 1 未満である必要がある: {}",
 			cfg.lr,
 			cfg.weight_decay
 		);
 	}
 	// 負や NaN の上限ではクリップの判定が意味をなさない
 	if !(cfg.grad_clip >= 0.0 && cfg.grad_clip.is_finite()) {
-		candle_core::bail!("grad_clip は 0 以上の有限値である必要がある: {}", cfg.grad_clip);
+		candle_core::bail!("--grad-clip は 0 以上の有限値である必要がある: {}", cfg.grad_clip);
 	}
 	// ファイルやパイプへのリダイレクト先と、エスケープシーケンスを解釈しない TERM=dumb の端末には、描き直しの制御コードを書き込まない
 	let use_viz =
@@ -932,7 +932,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		if missing > 0 {
 			candle_core::bail!("step {step}: {missing} 個のパラメータに勾配が届いていない");
 		}
-		grad_norm = Some(clip_grad_norm(&mut grads, &vars, cfg.grad_clip)?);
+		// 評価ログは eval_interval ごとにしか出ないので、どの step で壊れたかをエラーに入れる
+		let norm = clip_grad_norm(&mut grads, &vars, cfg.grad_clip)
+			.map_err(|e| candle_core::Error::Msg(format!("step {step}: {e}")))?;
+		grad_norm = Some(norm);
 		// 勾配そのままだと重みごとにスケールがばらばらなので、AdamW で過去の勾配の平均と大きさを使って歩幅を揃えて更新する
 		opt.set_learning_rate(lr_at(&cfg, step));
 		opt.step(&grads)?;
