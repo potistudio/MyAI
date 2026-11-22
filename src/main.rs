@@ -16,6 +16,9 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 
+mod viz;
+use viz::Viz;
+
 use candle_core::backprop::GradStore;
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
@@ -538,6 +541,14 @@ struct TrainArgs {
 	/// 学習後に生成するサンプルの文字数（0 で生成しない）
 	#[arg(long, default_value_t = 500)]
 	sample_len: usize,
+
+	/// 学習中、検証データの文章を各文字の予測の当たり具合で色分けして描き続ける
+	#[arg(long)]
+	viz: bool,
+
+	/// --viz の描き直し間隔（step 数）
+	#[arg(long, default_value_t = 10)]
+	viz_every: usize,
 }
 
 #[derive(Args)]
@@ -579,6 +590,9 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	};
 	if let Some(steps) = args.steps {
 		cfg.max_steps = steps;
+	}
+	if args.viz_every == 0 {
+		candle_core::bail!("--viz-every は 1 以上である必要がある");
 	}
 	// 割り切れないと 1 step あたりの本数が batch_size より少なくなり、どちらかが 0 だと勾配が 1 つも作られないので、GPU を確保する前に弾く
 	if cfg.batch_size == 0 || cfg.micro_batch == 0 || cfg.batch_size % cfg.micro_batch != 0 {
@@ -651,6 +665,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let t0 = Instant::now();
 	// 最終 step の重みは過学習で val loss 最小時より悪化しうるので、val loss が最小値を更新するたびに保存する
 	let mut best_val = f32::INFINITY;
+	let mut viz = args
+		.viz
+		.then(|| Viz::new(&tok, cfg.model.block_size, val))
+		.transpose()?;
 
 	for step in 0..=cfg.max_steps {
 		if step % cfg.eval_interval == 0 || step == cfg.max_steps {
@@ -661,12 +679,28 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 				best_val = va;
 				save_model(&args.out, &varmap, &cfg.model, &tok)?;
 			}
-			println!(
+			let line = format!(
 				"step {step:5} | train {tr:.4} | val {va:.4} | lr {:.2e} | {:.1}s{}",
 				opt.learning_rate(),
 				t0.elapsed().as_secs_f32(),
 				if improved { " | saved" } else { "" }
 			);
+			// 可視化中は画面を描き直すので、評価ログは流さずフレームの上部に表示させる
+			match &mut viz {
+				Some(v) => v.push_log(line),
+				None => println!("{line}"),
+			}
+		}
+		if let Some(v) = &viz
+			&& (step % args.viz_every == 0 || step == cfg.max_steps)
+		{
+			let progress = format!(
+				"step {step:5}/{} | lr {:.2e} | {:.1}s",
+				cfg.max_steps,
+				opt.learning_rate(),
+				t0.elapsed().as_secs_f32()
+			);
+			v.draw(&eval_model, &progress, dev)?;
 		}
 		if step == cfg.max_steps {
 			break;
@@ -696,6 +730,13 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		opt.step(&grads)?;
 	}
 
+	// フレームには評価ログの末尾しか出ないので、学習後に全体を残す
+	if let Some(v) = &viz {
+		println!();
+		for line in v.log() {
+			println!("{line}");
+		}
+	}
 	println!("best val {best_val:.4}: {}", args.out.display());
 
 	if args.sample_len > 0 {
