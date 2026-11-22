@@ -12,6 +12,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
+use candle_core::backprop::GradStore;
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
 	AdamW, Embedding, Init, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap, embedding, linear,
@@ -23,7 +24,10 @@ use rand::{RngExt, SeedableRng};
 
 struct Config {
 	block_size: usize,
+	// 1 回の重み更新に使う系列の本数。勾配はこの本数ぶんの平均になる
 	batch_size: usize,
+	// 1 回の forward / backward に載せる本数。batch_size を割り切れる値にする
+	micro_batch: usize,
 	n_layer: usize,
 	n_head: usize,
 	n_embd: usize,
@@ -39,6 +43,9 @@ impl Config {
 		Self {
 			block_size: 256,
 			batch_size: 64,
+			// 64 本を一度に流すと、attention の (B, H, T, T) 行列とその勾配が層ごとに残って 12GB に収まらない。
+			// 16 本ずつ 4 回に分けて勾配を足し合わせれば、更新 1 回あたりの勾配は 64 本のときと同じになる
+			micro_batch: 16,
 			n_layer: 6,
 			n_head: 6,
 			n_embd: 384,
@@ -54,6 +61,8 @@ impl Config {
 		Self {
 			block_size: 32,
 			batch_size: 16,
+			// 勾配累積の配線も tiny で確かめられるよう、1 step を 4 回の backward に分ける
+			micro_batch: 4,
 			n_layer: 2,
 			n_head: 2,
 			n_embd: 64,
@@ -277,8 +286,8 @@ fn causal_mask(t: usize, dev: &Device) -> Result<Tensor> {
 	Tensor::from_vec(mask, (t, t), dev)
 }
 
-fn get_batch(data: &[u32], cfg: &Config, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
-	let (b, t) = (cfg.batch_size, cfg.block_size);
+fn get_batch(data: &[u32], b: usize, cfg: &Config, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
+	let t = cfg.block_size;
 	let mut xs = Vec::with_capacity(b * t);
 	let mut ys = Vec::with_capacity(b * t);
 	for _ in 0..b {
@@ -299,11 +308,12 @@ fn compute_loss(model: &Gpt, x: &Tensor, y: &Tensor) -> Result<Tensor> {
 	loss::cross_entropy(&logits.reshape((b * t, v))?, &y.reshape(b * t)?)
 }
 
-// 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる
+// 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
+// model には計算グラフを作らない評価用モデル（main の eval_model）を渡す
 fn estimate_loss(model: &Gpt, data: &[u32], cfg: &Config, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 	let mut total = 0.0;
 	for _ in 0..cfg.eval_iters {
-		let (x, y) = get_batch(data, cfg, rng, dev)?;
+		let (x, y) = get_batch(data, cfg.batch_size, cfg, rng, dev)?;
 		total += compute_loss(model, &x, &y)?.to_scalar::<f32>()?;
 	}
 	Ok(total / cfg.eval_iters as f32)
@@ -342,6 +352,14 @@ fn main() -> Result<()> {
 		.map(String::as_str)
 		.unwrap_or("input.txt");
 	let cfg = if tiny { Config::tiny() } else { Config::gpu() };
+	// 割り切れないと 1 step あたりの本数が batch_size より少なくなり、どちらかが 0 だと勾配が 1 つも作られないので、GPU を確保する前に弾く
+	if cfg.batch_size == 0 || cfg.micro_batch == 0 || cfg.batch_size % cfg.micro_batch != 0 {
+		candle_core::bail!(
+			"batch_size ({}) と micro_batch ({}) は 1 以上で、batch_size は micro_batch で割り切れる必要がある",
+			cfg.batch_size,
+			cfg.micro_batch
+		);
+	}
 
 	let dev = Device::cuda_if_available(0)?;
 	let text = std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{path}: {e}")))?;
@@ -354,6 +372,21 @@ fn main() -> Result<()> {
 	let varmap = VarMap::new();
 	let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
 	let model = Gpt::new(&cfg, tok.vocab_size(), vb)?;
+	// Var から計算した結果は逆伝播用に入力への参照を持ち続けるので、forward だけでも中間テンソルが最後まで解放されない。
+	// 評価と生成は逆伝播しないので、detach した重みで同じ構造のモデルをもう 1 つ組んでそちらを使う。
+	// detach は Var と同じストレージを指し、AdamW の更新（Var::set）はストレージを書き換えるので、毎 step の重みがそのまま見える
+	let detached: HashMap<String, Tensor> = varmap
+		.data()
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|(name, var)| (name.clone(), var.as_tensor().detach()))
+		.collect();
+	let eval_model = Gpt::new(
+		&cfg,
+		tok.vocab_size(),
+		VarBuilder::from_tensors(detached, DType::F32, &dev),
+	)?;
 	let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
 	println!(
 		"device: {:?} / chars: {} / vocab: {} / params: {:.2}M",
@@ -370,13 +403,15 @@ fn main() -> Result<()> {
 			..Default::default()
 		},
 	)?;
+	// 勾配が全パラメータに届いているかの検査に使う
+	let vars: Vec<Tensor> = varmap.all_vars().iter().map(|v| v.as_tensor().clone()).collect();
 	let mut rng = StdRng::seed_from_u64(1337);
 	let t0 = Instant::now();
 
 	for step in 0..=cfg.max_steps {
 		if step % cfg.eval_interval == 0 || step == cfg.max_steps {
-			let tr = estimate_loss(&model, train, &cfg, &mut rng, &dev)?;
-			let va = estimate_loss(&model, val, &cfg, &mut rng, &dev)?;
+			let tr = estimate_loss(&eval_model, train, &cfg, &mut rng, &dev)?;
+			let va = estimate_loss(&eval_model, val, &cfg, &mut rng, &dev)?;
 			println!(
 				"step {step:5} | train {tr:.4} | val {va:.4} | {:.1}s",
 				t0.elapsed().as_secs_f32()
@@ -385,19 +420,22 @@ fn main() -> Result<()> {
 		if step == cfg.max_steps {
 			break;
 		}
-		let (x, y) = get_batch(train, &cfg, &mut rng, &dev)?;
-		let loss = compute_loss(&model, &x, &y)?;
-		// loss を下げるには各重みをどちらにどれだけ動かせばいいかを、逆伝播で全パラメータ分まとめて求める
-		let grads = loss.backward()?;
+		// loss を下げるには各重みをどちらにどれだけ動かせばいいかを、逆伝播で全パラメータ分まとめて求める。
+		// micro_batch ずつ backward して勾配を足し合わせる。各 loss を回数で割っておけば、合計は batch_size 本の平均 loss の勾配と同じになる。
+		// loss（計算グラフ）は 1 回ごとに捨てるので、同時に VRAM に載る中間テンソルは micro_batch 本ぶんだけで済む
+		let grad_accum = cfg.batch_size / cfg.micro_batch;
+		let mut grads = GradStore::default();
+		for _ in 0..grad_accum {
+			let (x, y) = get_batch(train, cfg.micro_batch, &cfg, &mut rng, &dev)?;
+			let loss = (compute_loss(&model, &x, &y)? / grad_accum as f64)?;
+			// extend は同じ TensorId の勾配を足し合わせ、無ければそのまま入れる
+			grads.extend(loss.backward()?)?;
+		}
 		// 部品を差し替えたときに勾配がエラーも出さず途切れる事故を、最初の 1 step で検出したい。
 		// ただし同じ重みに別経路から勾配が届く場合（Q/K 側だけ切れて V 側は生きている等）は素通りするので、
 		// 怪しいときは loss の下がり方で確認する
 		if step == 0 {
-			let missing = varmap
-				.all_vars()
-				.iter()
-				.filter(|v| grads.get(v.as_tensor()).is_none())
-				.count();
+			let missing = vars.iter().filter(|v| grads.get(v).is_none()).count();
 			if missing > 0 {
 				candle_core::bail!("{missing} 個のパラメータに勾配が届いていない");
 			}
@@ -408,7 +446,7 @@ fn main() -> Result<()> {
 
 	varmap.save("model.safetensors")?;
 
-	let out = generate(&model, &data[..1], 500, 0.8, &cfg, &mut rng, &dev)?;
+	let out = generate(&eval_model, &data[..1], 500, 0.8, &cfg, &mut rng, &dev)?;
 	println!("----\n{}", tok.decode(&out));
 	Ok(())
 }
