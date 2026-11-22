@@ -20,11 +20,8 @@ mod viz;
 use viz::Viz;
 
 use candle_core::backprop::GradStore;
-use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{
-	AdamW, Embedding, Init, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap, embedding, linear,
-	linear_no_bias, loss, ops,
-};
+use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
+use candle_nn::{AdamW, Embedding, Init, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap, loss, ops};
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -76,6 +73,12 @@ struct TrainConfig {
 	max_steps: usize,
 	// 学習時のみ有効にする。評価と生成では 0 にする
 	dropout: f32,
+	// 毎 step 重みを (1 - lr * weight_decay) 倍に縮め、大きな重みに頼った丸暗記を抑える。
+	// 1 次元の bias と LayerNorm には掛けない（ParamGroups 参照）
+	weight_decay: f64,
+	// 勾配全体の L2 ノルムがこの値を超えたら、向きを保ったままこの長さまで縮める。0 で無効。
+	// 運悪く loss の大きいバッチを引いた step で重みが大きく跳び、学習が崩れるのを防ぐ
+	grad_clip: f64,
 	eval_interval: usize,
 	eval_iters: usize,
 }
@@ -100,6 +103,9 @@ impl TrainConfig {
 			max_steps: 5000,
 			// dropout 0 では学習データ約 100 万文字に対して 10M パラメータが丸暗記に回り、val loss が step 1500 前後から上がる
 			dropout: 0.2,
+			// nanoGPT の既定値。candle の AdamW 既定は 0.01
+			weight_decay: 0.1,
+			grad_clip: 1.0,
 			eval_interval: 250,
 			eval_iters: 50,
 		}
@@ -123,6 +129,8 @@ impl TrainConfig {
 			max_steps: 1000,
 			// dropout の逆伝播経路も tiny で通すため 0 にしない
 			dropout: 0.1,
+			weight_decay: 0.1,
+			grad_clip: 1.0,
 			eval_interval: 200,
 			eval_iters: 10,
 		}
@@ -245,6 +253,39 @@ fn dropout(x: &Tensor, p: f32) -> Result<Tensor> {
 	if p > 0.0 { ops::dropout(x, p) } else { Ok(x.clone()) }
 }
 
+// candle の既定の初期値は linear が Kaiming（n_embd 384 で標準偏差約 0.07）、embedding が標準偏差 1 と大きい。
+// lm_head の入力は ln_f で分散 1 に揃うので、step 0 の logits の標準偏差は lm_head の重みでほぼ決まり、
+// Kaiming だと 0.07 * sqrt(384) ≒ 1.4 になって、loss が一様分布の ln(vocab) より高く出る（65 文字で 4.17 に対して約 5.1）。
+// embedding が大きいと、各層が残差に書き足す差分がそれに比べて小さくなり、序盤は層が効きにくい。
+// 序盤の step がこれらの修正に費やされないよう、nanoGPT と同じく平均 0・標準偏差 0.02 の正規分布から始め、bias は 0 にする
+const INIT_STD: f64 = 0.02;
+
+fn init_normal(stdev: f64) -> Init {
+	Init::Randn { mean: 0.0, stdev }
+}
+
+// 残差に書き足す出力層（attention と MLP の proj）は 1 層につき 2 回、合計 2 * n_layer 回足し合わされる。
+// 独立な値の和の分散は回数に比例して増えるので、標準偏差を 1/sqrt(2 * n_layer) 倍して、層を重ねても残差の大きさを揃える
+fn residual_std(cfg: &ModelConfig) -> f64 {
+	INIT_STD / (2.0 * cfg.n_layer as f64).sqrt()
+}
+
+// 重みとバイアスの名前は candle_nn::linear と同じにして、既存のモデルファイルもそのまま読めるようにする
+fn linear_init(in_dim: usize, out_dim: usize, stdev: f64, bias: bool, vb: VarBuilder) -> Result<Linear> {
+	let weight = vb.get_with_hints((out_dim, in_dim), "weight", init_normal(stdev))?;
+	let bias = bias
+		.then(|| vb.get_with_hints(out_dim, "bias", Init::Const(0.0)))
+		.transpose()?;
+	Ok(Linear::new(weight, bias))
+}
+
+fn embedding_init(n: usize, dim: usize, vb: VarBuilder) -> Result<Embedding> {
+	Ok(Embedding::new(
+		vb.get_with_hints((n, dim), "weight", init_normal(INIT_STD))?,
+		dim,
+	))
+}
+
 // 各位置に「過去のどの位置から情報を持ってくるか」を入力に応じて自分で決めさせたい。
 // そのために各位置のベクトルから 3 種類のベクトルを作る:
 //   Q（Query）: 自分が探している情報
@@ -262,8 +303,8 @@ struct CausalSelfAttention {
 impl CausalSelfAttention {
 	fn new(cfg: &ModelConfig, dropout: f32, vb: VarBuilder) -> Result<Self> {
 		// Q, K, V を 3 回の matmul に分けるより 1 回にまとめた方が GPU を効率よく使える
-		let c_attn = linear(cfg.n_embd, 3 * cfg.n_embd, vb.pp("c_attn"))?;
-		let c_proj = linear(cfg.n_embd, cfg.n_embd, vb.pp("c_proj"))?;
+		let c_attn = linear_init(cfg.n_embd, 3 * cfg.n_embd, INIT_STD, true, vb.pp("c_attn"))?;
+		let c_proj = linear_init(cfg.n_embd, cfg.n_embd, residual_std(cfg), true, vb.pp("c_proj"))?;
 		Ok(Self {
 			c_attn,
 			c_proj,
@@ -311,8 +352,8 @@ struct Mlp {
 impl Mlp {
 	fn new(cfg: &ModelConfig, dropout: f32, vb: VarBuilder) -> Result<Self> {
 		Ok(Self {
-			fc: linear(cfg.n_embd, 4 * cfg.n_embd, vb.pp("fc"))?,
-			proj: linear(4 * cfg.n_embd, cfg.n_embd, vb.pp("proj"))?,
+			fc: linear_init(cfg.n_embd, 4 * cfg.n_embd, INIT_STD, true, vb.pp("fc"))?,
+			proj: linear_init(4 * cfg.n_embd, cfg.n_embd, residual_std(cfg), true, vb.pp("proj"))?,
 			dropout,
 		})
 	}
@@ -364,15 +405,14 @@ impl Gpt {
 			.map(|i| Block::new(cfg, dropout, vb.pp(format!("h.{i}"))))
 			.collect::<Result<_>>()?;
 		Ok(Self {
-			// ID のままだと「3 番と 4 番は近い」という意味のない大小関係がつくので、ID ごとに学習可能なベクトルを割り当てる。
-			// candle の初期値は標準偏差 1 と大きめで、step 0 の loss が一様分布の ln(vocab) より高く出る（初期化の実験ネタ）
-			wte: embedding(vocab_size, cfg.n_embd, vb.pp("wte"))?,
+			// ID のままだと「3 番と 4 番は近い」という意味のない大小関係がつくので、ID ごとに学習可能なベクトルを割り当てる
+			wte: embedding_init(vocab_size, cfg.n_embd, vb.pp("wte"))?,
 			// attention は入力を順序のない集合として扱うので、「何文字目か」を位置ごとのベクトルとして足して教える。
 			// RoPE と比較するための基準として、最初は GPT-2 と同じ学習型の位置埋め込みにする
-			wpe: embedding(cfg.block_size, cfg.n_embd, vb.pp("wpe"))?,
+			wpe: embedding_init(cfg.block_size, cfg.n_embd, vb.pp("wpe"))?,
 			blocks,
 			ln_f: LayerNorm::new(cfg.n_embd, vb.pp("ln_f"))?,
-			lm_head: linear_no_bias(cfg.n_embd, vocab_size, vb.pp("lm_head"))?,
+			lm_head: linear_init(cfg.n_embd, vocab_size, INIT_STD, false, vb.pp("lm_head"))?,
 			dropout,
 		})
 	}
@@ -430,6 +470,65 @@ fn lr_at(cfg: &TrainConfig, step: usize) -> f64 {
 	let progress = ((step - cfg.warmup_steps) as f64 / decay_steps as f64).min(1.0);
 	let coeff = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
 	cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
+}
+
+// candle_nn::AdamW は全パラメータに同じ weight_decay を掛けるので、掛けたい重みと掛けたくない重みで AdamW を 2 つに分ける。
+// 行列（linear の重みと埋め込み）は値が大きいほど特定の入力を強く覚え込むので縮める。
+// 1 次元のもの（bias と LayerNorm のスケール・シフト）は出力の位置と大きさを合わせる値で、パラメータ全体のごく一部しかない。
+// 縮めても丸暗記はほとんど減らず、正規化後のスケールが 0 に引っ張られて学習の邪魔になるだけなので、nanoGPT に合わせて外す
+struct ParamGroups {
+	decay: AdamW,
+	no_decay: AdamW,
+}
+
+impl ParamGroups {
+	fn new(vars: Vec<Var>, params: ParamsAdamW) -> Result<Self> {
+		let (decay, no_decay): (Vec<Var>, Vec<Var>) = vars.into_iter().partition(|v| v.rank() >= 2);
+		Ok(Self {
+			decay: AdamW::new(decay, params.clone())?,
+			no_decay: AdamW::new(
+				no_decay,
+				ParamsAdamW {
+					weight_decay: 0.0,
+					..params
+				},
+			)?,
+		})
+	}
+
+	fn learning_rate(&self) -> f64 {
+		self.decay.learning_rate()
+	}
+
+	fn set_learning_rate(&mut self, lr: f64) {
+		self.decay.set_learning_rate(lr);
+		self.no_decay.set_learning_rate(lr);
+	}
+
+	fn step(&mut self, grads: &GradStore) -> Result<()> {
+		self.decay.step(grads)?;
+		self.no_decay.step(grads)
+	}
+}
+
+// 全パラメータの勾配を 1 本の長いベクトルとみなした L2 ノルムを求め、max_norm を超えていれば全勾配に同じ倍率を掛けて縮める。
+// パラメータごとに別々に縮めると更新の向きが変わってしまうので、全体で 1 つの倍率にする。返り値は縮める前のノルム
+fn clip_grad_norm(grads: &mut GradStore, vars: &[Tensor], max_norm: f64) -> Result<f32> {
+	let sq = vars
+		.iter()
+		.filter_map(|v| grads.get(v))
+		.map(|g| g.sqr()?.sum_all())
+		.collect::<Result<Vec<_>>>()?;
+	let norm = Tensor::stack(&sq, 0)?.sum_all()?.sqrt()?.to_scalar::<f32>()?;
+	if max_norm > 0.0 && norm as f64 > max_norm {
+		let scale = max_norm / norm as f64;
+		for v in vars {
+			if let Some(g) = grads.remove(v) {
+				grads.insert(v, (g * scale)?);
+			}
+		}
+	}
+	Ok(norm)
 }
 
 // 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
@@ -563,6 +662,14 @@ struct TrainArgs {
 	#[arg(long)]
 	dropout: Option<f32>,
 
+	/// 行列の重みに掛ける weight decay（省略時は設定ごとの既定値）。bias と LayerNorm には掛けない
+	#[arg(long)]
+	weight_decay: Option<f64>,
+
+	/// 勾配ノルムの上限（省略時は設定ごとの既定値）。0 でクリップしない
+	#[arg(long)]
+	grad_clip: Option<f64>,
+
 	/// CPU で数十秒で終わる小さい設定を使う
 	#[arg(long)]
 	tiny: bool,
@@ -637,6 +744,24 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			candle_core::bail!("--dropout は 0 以上 1 未満である必要がある: {p}");
 		}
 		cfg.dropout = p;
+	}
+	// 重みは毎 step (1 - lr * weight_decay) 倍されるので、負だと膨らみ続け、lr * weight_decay が 1 以上だと
+	// 1 step で 0 か符号反転になり、inf や NaN だと全重みが NaN になる
+	if let Some(wd) = args.weight_decay {
+		if !(wd >= 0.0 && wd * cfg.lr < 1.0) {
+			candle_core::bail!(
+				"--weight-decay は 0 以上で、lr ({}) との積が 1 未満である必要がある: {wd}",
+				cfg.lr
+			);
+		}
+		cfg.weight_decay = wd;
+	}
+	// 負や NaN の上限ではクリップの判定が意味をなさない
+	if let Some(c) = args.grad_clip {
+		if !(c >= 0.0 && c.is_finite()) {
+			candle_core::bail!("--grad-clip は 0 以上の有限値である必要がある: {c}");
+		}
+		cfg.grad_clip = c;
 	}
 	// ファイルやパイプへのリダイレクト先と、エスケープシーケンスを解釈しない TERM=dumb の端末には、描き直しの制御コードを書き込まない
 	let use_viz =
@@ -717,13 +842,14 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	);
 	println!("{summary}");
 
-	let mut opt = AdamW::new(
+	let mut opt = ParamGroups::new(
 		varmap.all_vars(),
 		ParamsAdamW {
 			lr: lr_at(&cfg, 0),
 			// 1 step あたりのトークン数が少なく勾配のばらつきが大きいので、nanoGPT の Shakespeare 設定に合わせて
 			// 2 次モーメントの平均を既定の 0.999 より短い期間で取る
 			beta2: 0.99,
+			weight_decay: cfg.weight_decay,
 			..Default::default()
 		},
 	)?;
@@ -733,6 +859,8 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let t0 = Instant::now();
 	// 最終 step の重みは過学習で val loss 最小時より悪化しうるので、val loss が最小値を更新するたびに保存する
 	let mut best_val = f32::INFINITY;
+	// 直前の step のクリップ前の勾配ノルム。評価ログに出し、クリップがどのくらいの頻度で効いているかの目安にする
+	let mut grad_norm: Option<f32> = None;
 	let mut viz = use_viz.then(|| Viz::new(&tok, cfg.model.block_size, val)).transpose()?;
 	// Viz::new が画面を消すので、学習後に出力する評価ログの先頭に同じ行を入れる
 	if let Some(v) = &mut viz {
@@ -749,8 +877,9 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 				save_model(&args.out, &varmap, &cfg.model, &tok)?;
 			}
 			let line = format!(
-				"step {step:5} | train {tr:.4} | val {va:.4} | lr {:.2e} | {:.1}s{}",
+				"step {step:5} | train {tr:.4} | val {va:.4} | lr {:.2e} | gnorm {} | {:.1}s{}",
 				opt.learning_rate(),
+				grad_norm.map_or_else(|| "-".to_string(), |n| format!("{n:.2}")),
 				t0.elapsed().as_secs_f32(),
 				if improved { " | saved" } else { "" }
 			);
@@ -785,15 +914,15 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			// extend は同じ TensorId の勾配を足し合わせ、無ければそのまま入れる
 			grads.extend(loss.backward()?)?;
 		}
-		// 部品を差し替えたときに勾配がエラーも出さず途切れる事故を、最初の 1 step で検出したい。
+		// 部品を差し替えたときに勾配がエラーも出さず途切れる事故を検出したい。勾配の無い重みは AdamW が黙って更新を飛ばし、
+		// clip_grad_norm もノルムに数えないので、気づかないまま固まり続ける。確認は表の引きだけで軽いので毎 step 行う。
 		// ただし同じ重みに別経路から勾配が届く場合（Q/K 側だけ切れて V 側は生きている等）は素通りするので、
 		// 怪しいときは loss の下がり方で確認する
-		if step == 0 {
-			let missing = vars.iter().filter(|v| grads.get(v).is_none()).count();
-			if missing > 0 {
-				candle_core::bail!("{missing} 個のパラメータに勾配が届いていない");
-			}
+		let missing = vars.iter().filter(|v| grads.get(v).is_none()).count();
+		if missing > 0 {
+			candle_core::bail!("step {step}: {missing} 個のパラメータに勾配が届いていない");
 		}
+		grad_norm = Some(clip_grad_norm(&mut grads, &vars, cfg.grad_clip)?);
 		// 勾配そのままだと重みごとにスケールがばらばらなので、AdamW で過去の勾配の平均と大きさを使って歩幅を揃えて更新する
 		opt.set_learning_rate(lr_at(&cfg, step));
 		opt.step(&grads)?;
