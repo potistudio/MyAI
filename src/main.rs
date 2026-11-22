@@ -10,7 +10,11 @@
 //!   → ln_f → lm_head で語彙ごとのスコア（logits）→ softmax で次の文字の確率
 
 use std::collections::{BTreeSet, HashMap};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+use clap::{Args, Parser, Subcommand};
 
 use candle_core::backprop::GradStore;
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
@@ -22,33 +26,65 @@ use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
-struct Config {
+// 学習済みファイルから Gpt を組み直すのに必要な値。モデルファイルの meta.config に同じ順序で保存する
+#[derive(Clone, Copy)]
+struct ModelConfig {
 	block_size: usize,
+	n_layer: usize,
+	n_head: usize,
+	n_embd: usize,
+}
+
+impl ModelConfig {
+	fn to_vec(self) -> Vec<u32> {
+		[self.block_size, self.n_layer, self.n_head, self.n_embd]
+			.map(|v| v as u32)
+			.to_vec()
+	}
+
+	fn from_slice(v: &[u32]) -> Result<Self> {
+		let &[block_size, n_layer, n_head, n_embd] = v else {
+			candle_core::bail!("meta.config の要素数が 4 ではない: {}", v.len());
+		};
+		let cfg = Self {
+			block_size: block_size as usize,
+			n_layer: n_layer as usize,
+			n_head: n_head as usize,
+			n_embd: n_embd as usize,
+		};
+		if cfg.n_head == 0 || cfg.n_embd % cfg.n_head != 0 {
+			candle_core::bail!("n_embd ({}) が n_head ({}) で割り切れない", cfg.n_embd, cfg.n_head);
+		}
+		Ok(cfg)
+	}
+}
+
+struct TrainConfig {
+	model: ModelConfig,
 	// 1 回の重み更新に使う系列の本数。勾配はこの本数ぶんの平均になる
 	batch_size: usize,
 	// 1 回の forward / backward に載せる本数。batch_size を割り切れる値にする
 	micro_batch: usize,
-	n_layer: usize,
-	n_head: usize,
-	n_embd: usize,
 	lr: f64,
 	max_steps: usize,
 	eval_interval: usize,
 	eval_iters: usize,
 }
 
-impl Config {
+impl TrainConfig {
 	// nanoGPT の文字単位 Shakespeare 設定と同規模にして、既知の loss（val 1.47 前後）と突き合わせられるようにする
 	fn gpu() -> Self {
 		Self {
-			block_size: 256,
+			model: ModelConfig {
+				block_size: 256,
+				n_layer: 6,
+				n_head: 6,
+				n_embd: 384,
+			},
 			batch_size: 64,
 			// 64 本を一度に流すと、attention の (B, H, T, T) 行列とその勾配が層ごとに残って 12GB に収まらない。
 			// 16 本ずつ 4 回に分けて勾配を足し合わせれば、更新 1 回あたりの勾配は 64 本のときと同じになる
 			micro_batch: 16,
-			n_layer: 6,
-			n_head: 6,
-			n_embd: 384,
 			lr: 1e-3,
 			max_steps: 5000,
 			eval_interval: 250,
@@ -59,13 +95,15 @@ impl Config {
 	// 配線ミスを GPU 無しでも数十秒で見つけたいので、CPU で回る大きさにする
 	fn tiny() -> Self {
 		Self {
-			block_size: 32,
+			model: ModelConfig {
+				block_size: 32,
+				n_layer: 2,
+				n_head: 2,
+				n_embd: 64,
+			},
 			batch_size: 16,
 			// 勾配累積の配線も tiny で確かめられるよう、1 step を 4 回の backward に分ける
 			micro_batch: 4,
-			n_layer: 2,
-			n_head: 2,
-			n_embd: 64,
 			lr: 3e-3,
 			max_steps: 1000,
 			eval_interval: 200,
@@ -84,7 +122,11 @@ struct Tokenizer {
 impl Tokenizer {
 	fn from_text(text: &str) -> Self {
 		// ID の割り当てを実行ごとに変えたくないので、ソート済みの集合から作る
-		let itos: Vec<char> = text.chars().collect::<BTreeSet<_>>().into_iter().collect();
+		Self::from_chars(text.chars().collect::<BTreeSet<_>>().into_iter().collect())
+	}
+
+	// 学習時と同じ ID 割り当てを再現するため、保存しておいた itos の並びから組み直す
+	fn from_chars(itos: Vec<char>) -> Self {
 		let stoi = itos.iter().enumerate().map(|(i, &c)| (c, i as u32)).collect();
 		Self { itos, stoi }
 	}
@@ -93,8 +135,16 @@ impl Tokenizer {
 		self.itos.len()
 	}
 
-	fn encode(&self, s: &str) -> Vec<u32> {
-		s.chars().map(|c| self.stoi[&c]).collect()
+	// プロンプトは学習データに無い文字を含みうるので、未知の文字はエラーにする
+	fn encode(&self, s: &str) -> Result<Vec<u32>> {
+		s.chars()
+			.map(|c| {
+				self.stoi
+					.get(&c)
+					.copied()
+					.ok_or_else(|| candle_core::Error::Msg(format!("語彙に無い文字: {c:?}")))
+			})
+			.collect()
 	}
 
 	fn decode(&self, ids: &[u32]) -> String {
@@ -154,7 +204,7 @@ struct CausalSelfAttention {
 }
 
 impl CausalSelfAttention {
-	fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
 		// Q, K, V を 3 回の matmul に分けるより 1 回にまとめた方が GPU を効率よく使える
 		let c_attn = linear(cfg.n_embd, 3 * cfg.n_embd, vb.pp("c_attn"))?;
 		let c_proj = linear(cfg.n_embd, cfg.n_embd, vb.pp("c_proj"))?;
@@ -200,7 +250,7 @@ struct Mlp {
 }
 
 impl Mlp {
-	fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
 		Ok(Self {
 			fc: linear(cfg.n_embd, 4 * cfg.n_embd, vb.pp("fc"))?,
 			proj: linear(4 * cfg.n_embd, cfg.n_embd, vb.pp("proj"))?,
@@ -220,7 +270,7 @@ struct Block {
 }
 
 impl Block {
-	fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
 		Ok(Self {
 			ln1: LayerNorm::new(cfg.n_embd, vb.pp("ln1"))?,
 			attn: CausalSelfAttention::new(cfg, vb.pp("attn"))?,
@@ -247,7 +297,7 @@ struct Gpt {
 }
 
 impl Gpt {
-	fn new(cfg: &Config, vocab_size: usize, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, vocab_size: usize, vb: VarBuilder) -> Result<Self> {
 		let blocks = (0..cfg.n_layer)
 			.map(|i| Block::new(cfg, vb.pp(format!("h.{i}"))))
 			.collect::<Result<_>>()?;
@@ -286,8 +336,7 @@ fn causal_mask(t: usize, dev: &Device) -> Result<Tensor> {
 	Tensor::from_vec(mask, (t, t), dev)
 }
 
-fn get_batch(data: &[u32], b: usize, cfg: &Config, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
-	let t = cfg.block_size;
+fn get_batch(data: &[u32], b: usize, t: usize, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
 	let mut xs = Vec::with_capacity(b * t);
 	let mut ys = Vec::with_capacity(b * t);
 	for _ in 0..b {
@@ -310,48 +359,187 @@ fn compute_loss(model: &Gpt, x: &Tensor, y: &Tensor) -> Result<Tensor> {
 
 // 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
 // model には計算グラフを作らない評価用モデル（main の eval_model）を渡す
-fn estimate_loss(model: &Gpt, data: &[u32], cfg: &Config, rng: &mut StdRng, dev: &Device) -> Result<f32> {
+fn estimate_loss(model: &Gpt, data: &[u32], cfg: &TrainConfig, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 	let mut total = 0.0;
 	for _ in 0..cfg.eval_iters {
-		let (x, y) = get_batch(data, cfg.batch_size, cfg, rng, dev)?;
+		let (x, y) = get_batch(data, cfg.batch_size, cfg.model.block_size, rng, dev)?;
 		total += compute_loss(model, &x, &y)?.to_scalar::<f32>()?;
 	}
 	Ok(total / cfg.eval_iters as f32)
 }
 
+// on_token は 1 文字引くたびに呼ばれ、CLI はここで逐次表示する
+#[allow(clippy::too_many_arguments)]
 fn generate(
 	model: &Gpt,
 	start: &[u32],
 	max_new: usize,
 	temperature: f64,
-	cfg: &Config,
+	block_size: usize,
 	rng: &mut StdRng,
 	dev: &Device,
+	mut on_token: impl FnMut(u32) -> Result<()>,
 ) -> Result<Vec<u32>> {
+	// 空の文脈では forward に長さ 0 の系列が渡り、最後の位置が存在しない
+	if start.is_empty() {
+		candle_core::bail!("生成の開始文字列が空");
+	}
 	let mut ids = start.to_vec();
 	for _ in 0..max_new {
 		// 仕組みを追いやすくするため毎回全文脈を計算し直す。KV キャッシュは推論側を作るときに入れる
-		let ctx = &ids[ids.len().saturating_sub(cfg.block_size)..];
+		let ctx = &ids[ids.len().saturating_sub(block_size)..];
 		let logits = model.forward(&Tensor::new(ctx, dev)?.unsqueeze(0)?)?;
 		// 次の文字の予測に使うのは最後の位置の出力だけ。
 		// temperature で割ってから softmax にかけ、1 未満なら確率の高い文字に寄せ、1 より大きければばらつかせる
 		let last = (logits.i((0, ctx.len() - 1))? / temperature)?;
 		let probs = softmax(&last)?.to_vec1::<f32>()?;
 		let dist = WeightedIndex::new(&probs).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-		ids.push(dist.sample(rng) as u32);
+		let id = dist.sample(rng) as u32;
+		ids.push(id);
+		on_token(id)?;
 	}
 	Ok(ids)
 }
 
-fn main() -> Result<()> {
-	let args: Vec<String> = std::env::args().skip(1).collect();
-	let tiny = args.iter().any(|a| a == "--tiny");
-	let path = args
+// モデルファイルには重みと一緒に、生成時に Gpt と Tokenizer を組み直すための値を入れる。
+// 学習データのテキストが無くても generate できるよう、語彙もここに持たせる
+const META_CONFIG: &str = "meta.config";
+const META_VOCAB: &str = "meta.vocab";
+
+fn save_model(path: &Path, varmap: &VarMap, cfg: &ModelConfig, tok: &Tokenizer) -> Result<()> {
+	let mut tensors: HashMap<String, Tensor> = varmap
+		.data()
+		.lock()
+		.unwrap()
 		.iter()
-		.find(|a| !a.starts_with("--"))
-		.map(String::as_str)
-		.unwrap_or("input.txt");
-	let cfg = if tiny { Config::tiny() } else { Config::gpu() };
+		.map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+		.collect();
+	tensors.insert(
+		META_CONFIG.to_string(),
+		Tensor::new(cfg.to_vec().as_slice(), &Device::Cpu)?,
+	);
+	let vocab: Vec<u32> = tok.itos.iter().map(|&c| c as u32).collect();
+	tensors.insert(META_VOCAB.to_string(), Tensor::new(vocab.as_slice(), &Device::Cpu)?);
+	candle_core::safetensors::save(&tensors, path)
+}
+
+fn load_model(path: &Path, dev: &Device) -> Result<(Gpt, ModelConfig, Tokenizer)> {
+	let mut tensors = candle_core::safetensors::load(path, dev)
+		.map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
+	let mut take_meta = |key: &str| -> Result<Vec<u32>> {
+		tensors
+			.remove(key)
+			.ok_or_else(|| {
+				candle_core::Error::Msg(format!(
+					"{}: {key} が無い。train サブコマンドで保存し直す必要がある",
+					path.display()
+				))
+			})?
+			.to_vec1::<u32>()
+	};
+	let cfg = ModelConfig::from_slice(&take_meta(META_CONFIG)?)?;
+	let itos = take_meta(META_VOCAB)?
+		.into_iter()
+		.map(|v| {
+			char::from_u32(v).ok_or_else(|| candle_core::Error::Msg(format!("{META_VOCAB} に不正な文字コード: {v}")))
+		})
+		.collect::<Result<Vec<char>>>()?;
+	let tok = Tokenizer::from_chars(itos);
+	// Var を経由せずテンソルから直接組むので、生成中に計算グラフは作られない
+	let model = Gpt::new(
+		&cfg,
+		tok.vocab_size(),
+		VarBuilder::from_tensors(tensors, DType::F32, dev),
+	)?;
+	Ok((model, cfg, tok))
+}
+
+#[derive(Parser)]
+#[command(version, about = "文字単位の最小 GPT を学習し、文章を生成する")]
+struct Cli {
+	/// CUDA が使える環境でも CPU で実行する
+	#[arg(long, global = true)]
+	cpu: bool,
+
+	#[command(subcommand)]
+	command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+	/// テキストファイルでモデルを学習し、重みを保存する
+	Train(TrainArgs),
+	/// 保存したモデルで文章を生成する
+	Generate(GenerateArgs),
+}
+
+#[derive(Args)]
+struct TrainArgs {
+	/// 学習データのテキストファイル
+	#[arg(default_value = "input.txt")]
+	data: PathBuf,
+
+	/// CPU で数十秒で終わる小さい設定を使う
+	#[arg(long)]
+	tiny: bool,
+
+	/// 学習済みモデルの保存先
+	#[arg(short, long, default_value = "model.safetensors")]
+	out: PathBuf,
+
+	/// 学習ステップ数（省略時は設定ごとの既定値）
+	#[arg(long)]
+	steps: Option<usize>,
+
+	/// バッチの抽出と学習後のサンプル生成に使う乱数シード
+	#[arg(long, default_value_t = 1337)]
+	seed: u64,
+
+	/// 学習後に生成するサンプルの文字数（0 で生成しない）
+	#[arg(long, default_value_t = 500)]
+	sample_len: usize,
+}
+
+#[derive(Args)]
+struct GenerateArgs {
+	/// train で保存したモデルファイル
+	#[arg(short, long, default_value = "model.safetensors")]
+	model: PathBuf,
+
+	/// 生成の書き出し（省略時は語彙の先頭の文字）
+	#[arg(short, long)]
+	prompt: Option<String>,
+
+	/// 生成する文字数
+	#[arg(short = 'n', long, default_value_t = 500)]
+	len: usize,
+
+	/// 1 未満で確率の高い文字に寄り、1 より大きいとばらつく
+	#[arg(short, long, default_value_t = 0.8)]
+	temperature: f64,
+
+	/// 乱数シード（省略時は実行ごとに変わる）
+	#[arg(long)]
+	seed: Option<u64>,
+}
+
+fn select_device(cpu: bool) -> Result<Device> {
+	if cpu {
+		Ok(Device::Cpu)
+	} else {
+		Device::cuda_if_available(0)
+	}
+}
+
+fn train(args: TrainArgs, dev: &Device) -> Result<()> {
+	let mut cfg = if args.tiny {
+		TrainConfig::tiny()
+	} else {
+		TrainConfig::gpu()
+	};
+	if let Some(steps) = args.steps {
+		cfg.max_steps = steps;
+	}
 	// 割り切れないと 1 step あたりの本数が batch_size より少なくなり、どちらかが 0 だと勾配が 1 つも作られないので、GPU を確保する前に弾く
 	if cfg.batch_size == 0 || cfg.micro_batch == 0 || cfg.batch_size % cfg.micro_batch != 0 {
 		candle_core::bail!(
@@ -361,17 +549,27 @@ fn main() -> Result<()> {
 		);
 	}
 
-	let dev = Device::cuda_if_available(0)?;
-	let text = std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{path}: {e}")))?;
+	let path = &args.data;
+	let text =
+		std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
 	let tok = Tokenizer::from_text(&text);
-	let data = tok.encode(&text);
+	let data = tok.encode(&text)?;
 	// 学習に使っていない部分で測らないと、丸暗記しただけでも loss が下がって見えてしまう
 	let n_train = data.len() * 9 / 10;
 	let (train, val) = data.split_at(n_train);
+	// get_batch は block_size + 1 文字の窓を取るので、どちらの区間もそれより長くないと範囲が空になる
+	if val.len() <= cfg.model.block_size + 1 {
+		candle_core::bail!(
+			"{}: 学習データが短すぎる（{} 文字。検証用の 1 割が block_size + 1 = {} 文字を超える必要がある）",
+			path.display(),
+			data.len(),
+			cfg.model.block_size + 1
+		);
+	}
 
 	let varmap = VarMap::new();
-	let vb = VarBuilder::from_varmap(&varmap, DType::F32, &dev);
-	let model = Gpt::new(&cfg, tok.vocab_size(), vb)?;
+	let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
+	let model = Gpt::new(&cfg.model, tok.vocab_size(), vb)?;
 	// Var から計算した結果は逆伝播用に入力への参照を持ち続けるので、forward だけでも中間テンソルが最後まで解放されない。
 	// 評価と生成は逆伝播しないので、detach した重みで同じ構造のモデルをもう 1 つ組んでそちらを使う。
 	// detach は Var と同じストレージを指し、AdamW の更新（Var::set）はストレージを書き換えるので、毎 step の重みがそのまま見える
@@ -383,9 +581,9 @@ fn main() -> Result<()> {
 		.map(|(name, var)| (name.clone(), var.as_tensor().detach()))
 		.collect();
 	let eval_model = Gpt::new(
-		&cfg,
+		&cfg.model,
 		tok.vocab_size(),
-		VarBuilder::from_tensors(detached, DType::F32, &dev),
+		VarBuilder::from_tensors(detached, DType::F32, dev),
 	)?;
 	let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
 	println!(
@@ -405,13 +603,13 @@ fn main() -> Result<()> {
 	)?;
 	// 勾配が全パラメータに届いているかの検査に使う
 	let vars: Vec<Tensor> = varmap.all_vars().iter().map(|v| v.as_tensor().clone()).collect();
-	let mut rng = StdRng::seed_from_u64(1337);
+	let mut rng = StdRng::seed_from_u64(args.seed);
 	let t0 = Instant::now();
 
 	for step in 0..=cfg.max_steps {
 		if step % cfg.eval_interval == 0 || step == cfg.max_steps {
-			let tr = estimate_loss(&eval_model, train, &cfg, &mut rng, &dev)?;
-			let va = estimate_loss(&eval_model, val, &cfg, &mut rng, &dev)?;
+			let tr = estimate_loss(&eval_model, train, &cfg, &mut rng, dev)?;
+			let va = estimate_loss(&eval_model, val, &cfg, &mut rng, dev)?;
 			println!(
 				"step {step:5} | train {tr:.4} | val {va:.4} | {:.1}s",
 				t0.elapsed().as_secs_f32()
@@ -426,7 +624,7 @@ fn main() -> Result<()> {
 		let grad_accum = cfg.batch_size / cfg.micro_batch;
 		let mut grads = GradStore::default();
 		for _ in 0..grad_accum {
-			let (x, y) = get_batch(train, cfg.micro_batch, &cfg, &mut rng, &dev)?;
+			let (x, y) = get_batch(train, cfg.micro_batch, cfg.model.block_size, &mut rng, dev)?;
 			let loss = (compute_loss(&model, &x, &y)? / grad_accum as f64)?;
 			// extend は同じ TensorId の勾配を足し合わせ、無ければそのまま入れる
 			grads.extend(loss.backward()?)?;
@@ -444,9 +642,68 @@ fn main() -> Result<()> {
 		opt.step(&grads)?;
 	}
 
-	varmap.save("model.safetensors")?;
+	save_model(&args.out, &varmap, &cfg.model, &tok)?;
+	println!("saved: {}", args.out.display());
 
-	let out = generate(&eval_model, &data[..1], 500, 0.8, &cfg, &mut rng, &dev)?;
-	println!("----\n{}", tok.decode(&out));
+	if args.sample_len > 0 {
+		let out = generate(
+			&eval_model,
+			&[0],
+			args.sample_len,
+			0.8,
+			cfg.model.block_size,
+			&mut rng,
+			dev,
+			|_| Ok(()),
+		)?;
+		println!("----\n{}", tok.decode(&out));
+	}
 	Ok(())
+}
+
+fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
+	// temperature で logits を割るので、0 以下だと確率分布にならない
+	if !(args.temperature > 0.0) {
+		candle_core::bail!("temperature は 0 より大きい必要がある: {}", args.temperature);
+	}
+	let (model, cfg, tok) = load_model(&args.model, dev)?;
+	let start = match &args.prompt {
+		Some(p) => tok.encode(p)?,
+		None => vec![0],
+	};
+	let seed = args.seed.unwrap_or_else(rand::random);
+	// 出力を標準出力に流すので、同じ結果を再現するためのシードは標準エラーに出す
+	if args.seed.is_none() {
+		eprintln!("seed: {seed}");
+	}
+	let mut rng = StdRng::seed_from_u64(seed);
+
+	let mut stdout = std::io::stdout().lock();
+	let io_err = |e: std::io::Error| candle_core::Error::Msg(e.to_string());
+	write!(stdout, "{}", tok.decode(&start)).map_err(io_err)?;
+	stdout.flush().map_err(io_err)?;
+	generate(
+		&model,
+		&start,
+		args.len,
+		args.temperature,
+		cfg.block_size,
+		&mut rng,
+		dev,
+		|id| {
+			write!(stdout, "{}", tok.decode(&[id])).map_err(io_err)?;
+			stdout.flush().map_err(io_err)
+		},
+	)?;
+	writeln!(stdout).map_err(io_err)?;
+	Ok(())
+}
+
+fn main() -> Result<()> {
+	let cli = Cli::parse();
+	let dev = select_device(cli.cpu)?;
+	match cli.command {
+		Command::Train(args) => train(args, &dev),
+		Command::Generate(args) => generate_cmd(args, &dev),
+	}
 }

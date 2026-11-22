@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 candle-core = "0.11.1"
 candle-nn = "0.11.1"
+clap = { version = "4.6.9", features = ["derive"] }
 rand = "0.10.4"
 
 # candle-kernels 0.11.1 の compatibility.cuh は __CUDA_ARCH__ 未定義のホストパスでも
