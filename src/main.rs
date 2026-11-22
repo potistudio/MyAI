@@ -147,8 +147,8 @@ impl TrainConfig {
 	}
 
 	// モデルの形は土台のモデルファイルから受け取る。
-	// 会話データは約 160 万文字で 1 step（64 本 × block_size 文字）の約 100 倍しかなく、10 epoch で一巡するので、
-	// 事前学習より lr を約 1/3 に下げ、step 数も減らす。lr が大きいと事前学習で得た重みが大きく動き、文章力が落ちる
+	// 会話データは約 160 万文字で、1 step（64 本 × 256 文字）の約 100 倍しかない。max_steps 1000 で約 10 周するので、
+	// 事前学習より lr を約 1/3 に下げ、step 数も 1/5 に減らす。lr が大きいと事前学習で得た重みが大きく動き、文章力が落ちる
 	fn finetune(model: ModelConfig) -> Self {
 		Self {
 			model,
@@ -540,7 +540,8 @@ fn get_batch(sources: &[(Corpus, f64)], b: usize, t: usize, rng: &mut StdRng, de
 	let mut ys = Vec::with_capacity(b * t);
 	let mut ws = Vec::with_capacity(b * t);
 	for _ in 0..b {
-		// 抽出元が 1 つのときは乱数を引かない。引くと同じ --seed でも窓の位置の列が変わり、抽選を入れる前の train の結果を再現できない
+		// 抽出元が 1 つのときは乱数を引かない。同じ --seed なら、train の窓の位置の列が抽選を入れる前と一致する。
+		// 重みの初期値は candle がプロセス共通の乱数で引くので --seed では固定されず、学習結果そのものは実行ごとに変わる
 		let src = if sources.len() == 1 {
 			sources[0].0
 		} else {
@@ -1134,6 +1135,14 @@ fn fit(f: Fit, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 			println!("{line}");
 		}
 	}
+	// val loss が NaN だと最小値の更新が起きず、一度も保存されない。
+	// そのまま返すと、呼び出し側のサンプル生成が前回の実行で残ったファイルを読む
+	if !best_val.is_finite() {
+		candle_core::bail!(
+			"val loss が有限の値にならず、{} を一度も保存していない",
+			f.out.display()
+		);
+	}
 	println!("best val {best_val:.4}: {}", f.out.display());
 	Ok(best_val)
 }
@@ -1249,6 +1258,10 @@ fn init_from_base(
 fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 	if !(0.0..1.0).contains(&args.mix_ratio) {
 		candle_core::bail!("--mix-ratio は 0 以上 1 未満である必要がある: {}", args.mix_ratio);
+	}
+	// 割合 0 では --mix のコーパスが一度も抽出されず、読み込みのメモリと時間だけを使う
+	if args.mix.is_some() && args.mix_ratio == 0.0 {
+		candle_core::bail!("--mix-ratio 0 では --mix のコーパスが一度も使われない。0 より大きい値を指定する");
 	}
 	let (base, model_cfg, base_tok) = load_tensors(&args.base, dev)?;
 	let mut cfg = TrainConfig::finetune(model_cfg);
@@ -1433,12 +1446,17 @@ impl ChatIds {
 	) -> Result<()> {
 		// generate は直近 block_size 文字だけを文脈にするので、そのままでは文脈が発言の途中から始まることがある。
 		// 文脈に収まる範囲で最も古い User の発言の開始位置より前を捨て、発言の境界から始まる文脈にする。
-		// 収まる範囲に User の発言の開始が無い場合（最後の発言だけで block_size を超える）は捨てずに渡す
+		// 学習データでは User の発言の開始は前の発言の終わりの印の直後に置かれるので、窓に収まる場合はその終わりの印も残す。
+		// 収まる範囲に User の発言の開始が無い場合（最後の発言だけで block_size を超える）は、窓の先頭より前を捨てる。
+		// generate は窓より前を読まないので、残すと毎ターン履歴が伸びるだけになる
 		if history.len() > block_size {
 			let from = history.len() - block_size;
-			if let Some(i) = history[from..].iter().position(|&id| id == self.user) {
-				history.drain(..from + i);
-			}
+			let cut = match history[from..].iter().position(|&id| id == self.user) {
+				Some(0) => from,
+				Some(i) => from + i - 1,
+				None => from,
+			};
+			history.drain(..cut);
 		}
 		let out = generate(model, history, max_len, temperature, block_size, rng, dev, |id| {
 			if self.is_marker(id) {
@@ -1471,8 +1489,8 @@ fn printable(tok: &Tokenizer, id: u32) -> String {
 }
 
 fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
-	// temperature で logits を割るので、0 以下だと確率分布にならない
-	if !(args.temperature > 0.0) {
+	// temperature で logits を割るので、0 以下か NaN だと確率分布にならない
+	if args.temperature.is_nan() || args.temperature <= 0.0 {
 		candle_core::bail!("temperature は 0 より大きい必要がある: {}", args.temperature);
 	}
 	let (model, cfg, tok) = load_model(&args.model, dev)?;
@@ -1511,8 +1529,8 @@ fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
 }
 
 fn chat_cmd(args: ChatArgs, dev: &Device) -> Result<()> {
-	// temperature で logits を割るので、0 以下だと確率分布にならない
-	if !(args.temperature > 0.0) {
+	// temperature で logits を割るので、0 以下か NaN だと確率分布にならない
+	if args.temperature.is_nan() || args.temperature <= 0.0 {
 		candle_core::bail!("temperature は 0 より大きい必要がある: {}", args.temperature);
 	}
 	let (model, cfg, tok) = load_model(&args.model, dev)?;
@@ -1552,9 +1570,10 @@ fn chat_cmd(args: ChatArgs, dev: &Device) -> Result<()> {
 			}
 			_ => {}
 		}
-		// 入力の誤りで対話を終了させないよう、エラーを表示して次の入力を待つ
+		// 入力の誤りで対話を終了させないよう、エラーを表示して次の入力を待つ。
+		// 会話を標準出力から記録したときに本文と区別できるよう、エラーは標準エラーに出す
 		if let Err(e) = ids.push_user(&tok, &mut history, text) {
-			writeln!(stdout, "{e}").map_err(io_err)?;
+			eprintln!("エラー: {e}");
 			continue;
 		}
 		write!(stdout, "AI: ").map_err(io_err)?;
