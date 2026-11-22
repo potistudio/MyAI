@@ -983,6 +983,8 @@ dependencies = [
  "candle-nn",
  "clap",
  "rand 0.10.4",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

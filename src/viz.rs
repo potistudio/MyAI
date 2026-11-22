@@ -7,7 +7,7 @@ use std::io::Write as _;
 
 use candle_core::{Device, Result, Tensor};
 
-use crate::{Gpt, Tokenizer, softmax};
+use crate::{Gpt, Tokenizer, chat, softmax};
 
 // 描画ごとに表示する評価ログの行数。全行を出すとフレームが端末の高さを超え、カーソルを先頭に戻す描き直しが崩れる
 const LOG_TAIL: usize = 5;
@@ -21,15 +21,15 @@ pub struct Viz<'a> {
 }
 
 impl<'a> Viz<'a> {
-	pub fn new(tok: &'a Tokenizer, block_size: usize, val: &[u16]) -> Result<Self> {
+	/// start_after が Some なら、検証データ中で最初に現れるその文字の直後から表示する。None なら先頭から表示する
+	pub fn new(tok: &'a Tokenizer, block_size: usize, val: &[u16], start_after: Option<char>) -> Result<Self> {
 		// Windows の従来コンソールは既定でエスケープシーケンスを解釈しないので、仮想端末処理を有効にする。
 		// 有効にできない端末でも学習自体は続けられるので、結果は確認しない
 		let _ = anstyle_query::windows::enable_ansi_colors();
-		// 区間が単語の途中から始まると文脈表示が読みにくいので、最初の改行の直後から使う。
+		// 区間が単語の途中から始まると文脈表示が読みにくいので、区切りの文字（文章なら改行）の直後から使う。
 		// ただし get_batch と同じく block_size + 1 文字を確保できない場合は先頭から使う
-		let start = tok
-			.stoi
-			.get(&'\n')
+		let start = start_after
+			.and_then(|c| tok.stoi.get(&c))
 			.and_then(|&nl| val.iter().position(|&id| id as u32 == nl))
 			.map(|i| i + 1)
 			.filter(|&i| val.len() - i > block_size + 1)
@@ -118,7 +118,8 @@ impl<'a> Viz<'a> {
 				Some(j) => line.push_str(&paint(visible_cell(c), probs[j])),
 				None => line.push(visible_cell(c)),
 			}
-			if c == '\n' {
+			// 会話データの発言は改行をほぼ含まず、改行だけで区切ると 1 行が端末幅を超えるので、発言の終わりでも改行する
+			if c == '\n' || c == chat::END {
 				lines.push(std::mem::take(&mut line));
 			}
 		}
@@ -129,11 +130,12 @@ impl<'a> Viz<'a> {
 
 // 背景色で塗るので、空白は空白のままでも位置が見える。改行は記号に置き換える。
 // それ以外の制御文字（CRLF の \r、タブ、ESC など）はカーソル移動や描画の崩れを起こすので、1 文字幅の記号に置き換える
+// 会話の区切りの印は私用領域の文字で字形が無いので、記号に置き換える
 fn visible_cell(c: char) -> char {
 	match c {
 		'\n' => '↵',
 		c if c.is_control() => '·',
-		c => c,
+		c => chat::symbol(c).unwrap_or(c),
 	}
 }
 

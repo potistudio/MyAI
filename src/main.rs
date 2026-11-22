@@ -8,20 +8,27 @@
 //!   文字列 → Tokenizer で ID 列 → wte + wpe でベクトル列
 //!   → Block × N（Attention で過去から情報を集め、MLP で加工し、残差に書き足す）
 //!   → ln_f → lm_head で語彙ごとのスコア（logits）→ softmax で次の文字の確率
+//!
+//! 対話モデルは 2 段階で作る。重みは最後まで 1 組で、汎用の文章力と対話の振る舞いを同じ重みに持たせる:
+//!   train    文章コーパスで次の文字の予測を学習する（事前学習）
+//!   finetune train の重みから始め、会話データの AI の返事の部分だけを loss に数えて追加学習する（SFT）
+//!   chat     finetune の重みで、入力した発言への返事を生成する
 
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand};
 
+mod chat;
 mod viz;
 use viz::Viz;
 
 use candle_core::backprop::GradStore;
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor, Var};
-use candle_nn::{AdamW, Embedding, Init, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap, loss, ops};
+use candle_nn::{AdamW, Embedding, Init, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap, ops};
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -138,6 +145,55 @@ impl TrainConfig {
 			eval_iters: 10,
 		}
 	}
+
+	// モデルの形は土台のモデルファイルから受け取る。
+	// 会話データは約 160 万文字で 1 step（64 本 × block_size 文字）の約 100 倍しかなく、10 epoch で一巡するので、
+	// 事前学習より lr を約 1/3 に下げ、step 数も減らす。lr が大きいと事前学習で得た重みが大きく動き、文章力が落ちる
+	fn finetune(model: ModelConfig) -> Self {
+		Self {
+			model,
+			batch_size: 64,
+			micro_batch: 16,
+			lr: 3e-4,
+			min_lr: 3e-5,
+			warmup_steps: 50,
+			max_steps: 1000,
+			dropout: 0.1,
+			weight_decay: 0.1,
+			grad_clip: 1.0,
+			eval_interval: 50,
+			eval_iters: 20,
+		}
+	}
+
+	// CLI で上書きした後の値と既定値を同じ条件で検査するため、上書きの適用後に呼ぶ
+	fn validate(&self) -> Result<()> {
+		if !(0.0..1.0).contains(&self.dropout) {
+			candle_core::bail!("--dropout は 0 以上 1 未満である必要がある: {}", self.dropout);
+		}
+		// 重みは毎 step (1 - lr * weight_decay) 倍されるので、負だと膨らみ続け、lr * weight_decay が 1 以上だと
+		// 1 step で 0 か符号反転になり、inf や NaN だと全重みが NaN になる
+		if !(self.weight_decay >= 0.0 && self.weight_decay * self.lr < 1.0) {
+			candle_core::bail!(
+				"--weight-decay は 0 以上で、lr ({}) との積が 1 未満である必要がある: {}",
+				self.lr,
+				self.weight_decay
+			);
+		}
+		// 負や NaN の上限ではクリップの判定が意味をなさない
+		if !(self.grad_clip >= 0.0 && self.grad_clip.is_finite()) {
+			candle_core::bail!("--grad-clip は 0 以上の有限値である必要がある: {}", self.grad_clip);
+		}
+		// 割り切れないと 1 step あたりの本数が batch_size より少なくなり、どちらかが 0 だと勾配が 1 つも作られないので、GPU を確保する前に弾く
+		if self.batch_size == 0 || self.micro_batch == 0 || self.batch_size % self.micro_batch != 0 {
+			candle_core::bail!(
+				"batch_size ({}) と micro_batch ({}) は 1 以上で、batch_size は micro_batch で割り切れる必要がある",
+				self.batch_size,
+				self.micro_batch
+			);
+		}
+		Ok(())
+	}
 }
 
 // ニューラルネットは数値しか扱えないので、文字を整数 ID に置き換える必要がある。
@@ -149,18 +205,15 @@ struct Tokenizer {
 
 impl Tokenizer {
 	fn from_texts(texts: &[&str]) -> Self {
-		// 数 GB のコーパスでも 1 パスで速く終わるよう、集合ではなく文字コードで直接引けるフラグ表に出現を記録する
-		let mut seen = vec![false; char::MAX as usize + 1];
-		for c in texts.iter().flat_map(|t| t.chars()) {
-			seen[c as usize] = true;
-		}
-		// ID の割り当てを実行ごとに変えたくないので、文字コード順に並べる
-		Self::from_chars(
-			(0..seen.len() as u32)
-				.filter(|&i| seen[i as usize])
-				.filter_map(char::from_u32)
-				.collect(),
-		)
+		Self::from_chars(distinct_chars(texts))
+	}
+
+	// 既存の ID を変えずに、texts に出てきて語彙に無い文字を末尾に足した語彙を作る。
+	// 既存の ID が変わらないので、学習済みの wte と lm_head の各行を同じ番号のまま新しい語彙でも使える
+	fn extended(&self, texts: &[&str]) -> Self {
+		let mut itos = self.itos.clone();
+		itos.extend(distinct_chars(texts).into_iter().filter(|c| !self.stoi.contains_key(c)));
+		Self::from_chars(itos)
 	}
 
 	// 学習時と同じ ID 割り当てを再現するため、保存しておいた itos の並びから組み直す
@@ -211,6 +264,19 @@ impl Tokenizer {
 	fn decode(&self, ids: &[u32]) -> String {
 		ids.iter().map(|&i| self.itos[i as usize]).collect()
 	}
+}
+
+// ID の割り当てを実行ごとに変えないよう、文字コード順に並べて返す
+fn distinct_chars(texts: &[&str]) -> Vec<char> {
+	// 数 GB のコーパスでも 1 パスで速く終わるよう、集合ではなく文字コードで直接引けるフラグ表に出現を記録する
+	let mut seen = vec![false; char::MAX as usize + 1];
+	for c in texts.iter().flat_map(|t| t.chars()) {
+		seen[c as usize] = true;
+	}
+	(0..seen.len() as u32)
+		.filter(|&i| seen[i as usize])
+		.filter_map(char::from_u32)
+		.collect()
 }
 
 // candle_nn の LayerNorm と softmax_last_dim は高速化用の専用カーネルを使う代わりに逆伝播を持たず、
@@ -443,25 +509,86 @@ fn causal_mask(t: usize, dev: &Device) -> Result<Tensor> {
 	Tensor::from_vec(mask, (t, t), dev)
 }
 
-fn get_batch(data: &[u16], b: usize, t: usize, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
+// 学習と評価で窓を切り出す元の ID 列。
+// mask が None なら全文字を正解として loss に数え（事前学習）、Some なら true の文字だけを数える（会話データの AI の返事）
+#[derive(Clone, Copy)]
+struct Corpus<'a> {
+	ids: &'a [u16],
+	mask: Option<&'a [bool]>,
+}
+
+impl<'a> Corpus<'a> {
+	fn plain(ids: &'a [u16]) -> Self {
+		Self { ids, mask: None }
+	}
+}
+
+struct Batch {
+	x: Tensor,
+	y: Tensor,
+	// 位置ごとの loss の重み（1 か 0）。形は (B * T)
+	weight: Tensor,
+	// weight の合計。loss の平均を取るときの分母
+	n_targets: f64,
+}
+
+// sources は (抽出元, 抽出割合) の組。1 本ごとに割合に従って抽出元を選ぶ。
+// finetune で会話データと文章コーパスを混ぜるのに使う。会話データだけで学習すると、事前学習で得た文章力が失われていく
+fn get_batch(sources: &[(Corpus, f64)], b: usize, t: usize, rng: &mut StdRng, dev: &Device) -> Result<Batch> {
+	let total: f64 = sources.iter().map(|(_, w)| w).sum();
 	let mut xs = Vec::with_capacity(b * t);
 	let mut ys = Vec::with_capacity(b * t);
+	let mut ws = Vec::with_capacity(b * t);
 	for _ in 0..b {
+		// 抽出元が 1 つのときは乱数を引かない。引くと同じ --seed でも窓の位置の列が変わり、抽選を入れる前の train の結果を再現できない
+		let src = if sources.len() == 1 {
+			sources[0].0
+		} else {
+			let mut r = rng.random::<f64>() * total;
+			// 浮動小数の丸めで r が合計をわずかに超えた場合は最後の抽出元を使う
+			sources
+				.iter()
+				.find(|(_, w)| {
+					r -= w;
+					r < 0.0
+				})
+				.unwrap_or(&sources[sources.len() - 1])
+				.0
+		};
+		let data = src.ids;
 		let i = rng.random_range(0..data.len() - t - 1);
 		xs.extend(data[i..i + t].iter().map(|&id| id as u32));
 		// 全位置で同時に「次の 1 トークン」を予測させるため、入力を 1 つずらしたものを正解にする。
 		// causal mask があるので、長さ T の 1 本から「1 文字目まで → 2 文字目」…「T 文字目まで → T+1 文字目」の T 問を 1 回で解かせられる
 		ys.extend(data[i + 1..i + t + 1].iter().map(|&id| id as u32));
+		// mask は正解側の文字に対応させる。入力の文字ではなく、予測する文字が AI の返事かどうかで数えるかを決める
+		match src.mask {
+			Some(m) => ws.extend(m[i + 1..i + t + 1].iter().map(|&c| if c { 1.0f32 } else { 0.0 })),
+			None => ws.extend(std::iter::repeat_n(1.0f32, t)),
+		}
 	}
-	Ok((Tensor::from_vec(xs, (b, t), dev)?, Tensor::from_vec(ys, (b, t), dev)?))
+	let n_targets = ws.iter().map(|&w| w as f64).sum();
+	Ok(Batch {
+		x: Tensor::from_vec(xs, (b, t), dev)?,
+		y: Tensor::from_vec(ys, (b * t, 1), dev)?,
+		weight: Tensor::from_vec(ws, b * t, dev)?,
+		n_targets,
+	})
 }
 
 // 「正解の文字につけた確率の -log」（cross entropy）を最小化したい。正解に確率 1 を出せば 0 になる。
-// 全文字を当てずっぽうにすると ln(vocab) で、65 文字なら 4.17。loss 2.0 は e^2 ≒ 7 択まで絞れている状態
-fn compute_loss(model: &Gpt, x: &Tensor, y: &Tensor) -> Result<Tensor> {
-	let logits = model.forward(x)?;
+// 全文字を当てずっぽうにすると ln(vocab) で、65 文字なら 4.17。loss 2.0 は e^2 ≒ 7 択まで絞れている状態。
+// 返り値は weight を掛けた合計で、平均にはしない。勾配累積では 1 step 分の n_targets の合計で割り、
+// micro batch ごとに数える文字数が違っても、1 step 内の全対象文字の平均 loss の勾配にする
+fn loss_sum(model: &Gpt, batch: &Batch) -> Result<Tensor> {
+	let logits = model.forward(&batch.x)?;
 	let (b, t, v) = logits.dims3()?;
-	loss::cross_entropy(&logits.reshape((b * t, v))?, &y.reshape(b * t)?)
+	// candle_nn::loss::cross_entropy と同じ計算で、平均を取る前の位置ごとの値を得るために展開している
+	let nll = ops::log_softmax(&logits.reshape((b * t, v))?, D::Minus1)?
+		.gather(&batch.y, 1)?
+		.flatten_all()?
+		.neg()?;
+	(nll * &batch.weight)?.sum_all()
 }
 
 // 後半も lr が大きいままだと学習データへの過適合が進むので、ウォームアップ後は cosine で min_lr まで下げる
@@ -540,17 +667,24 @@ fn clip_grad_norm(grads: &mut GradStore, vars: &[Tensor], max_norm: f64) -> Resu
 }
 
 // 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
-// model には計算グラフを作らない評価用モデル（main の eval_model）を渡す
-fn estimate_loss(model: &Gpt, data: &[u16], cfg: &TrainConfig, rng: &mut StdRng, dev: &Device) -> Result<f32> {
-	let mut total = 0.0;
+// mask 付きのデータではバッチごとに数える文字数が違うので、バッチの平均の平均ではなく、全対象文字の平均にする。
+// model には計算グラフを作らない評価用モデル（fit の eval_model）を渡す
+fn estimate_loss(model: &Gpt, data: Corpus, cfg: &TrainConfig, rng: &mut StdRng, dev: &Device) -> Result<f32> {
+	let (mut sum, mut n) = (0.0f64, 0.0f64);
 	for _ in 0..cfg.eval_iters {
-		let (x, y) = get_batch(data, cfg.batch_size, cfg.model.block_size, rng, dev)?;
-		total += compute_loss(model, &x, &y)?.to_scalar::<f32>()?;
+		let batch = get_batch(&[(data, 1.0)], cfg.batch_size, cfg.model.block_size, rng, dev)?;
+		sum += loss_sum(model, &batch)?.to_scalar::<f32>()? as f64;
+		n += batch.n_targets;
 	}
-	Ok(total / cfg.eval_iters as f32)
+	// 0 件を loss 0 として返すと、fit がそれを最小値として保存し、以後の重みが保存されなくなる
+	if n == 0.0 {
+		candle_core::bail!("評価に使ったバッチに、loss に数える文字（AI の発言）が 1 文字も無い");
+	}
+	Ok((sum / n) as f32)
 }
 
-// on_token は 1 文字引くたびに呼ばれ、CLI はここで逐次表示する
+// on_token は 1 文字引くたびに呼ばれ、CLI はここで逐次表示する。
+// Break を返すとその文字を末尾に含めたまま生成を止める。chat は返事の終わりの印で止めるのに使う
 #[allow(clippy::too_many_arguments)]
 fn generate(
 	model: &Gpt,
@@ -560,7 +694,7 @@ fn generate(
 	block_size: usize,
 	rng: &mut StdRng,
 	dev: &Device,
-	mut on_token: impl FnMut(u32) -> Result<()>,
+	mut on_token: impl FnMut(u32) -> Result<ControlFlow<()>>,
 ) -> Result<Vec<u32>> {
 	// 空の文脈では forward に長さ 0 の系列が渡り、最後の位置が存在しない
 	if start.is_empty() {
@@ -578,7 +712,9 @@ fn generate(
 		let dist = WeightedIndex::new(&probs).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
 		let id = dist.sample(rng) as u32;
 		ids.push(id);
-		on_token(id)?;
+		if on_token(id)?.is_break() {
+			break;
+		}
 	}
 	Ok(ids)
 }
@@ -606,6 +742,19 @@ fn save_model(path: &Path, varmap: &VarMap, cfg: &ModelConfig, tok: &Tokenizer) 
 }
 
 fn load_model(path: &Path, dev: &Device) -> Result<(Gpt, ModelConfig, Tokenizer)> {
+	let (tensors, cfg, tok) = load_tensors(path, dev)?;
+	// Var を経由せずテンソルから直接組むので、生成中に計算グラフは作られない
+	let model = Gpt::new(
+		&cfg,
+		tok.vocab_size(),
+		0.0,
+		VarBuilder::from_tensors(tensors, DType::F32, dev),
+	)?;
+	Ok((model, cfg, tok))
+}
+
+// 返り値の HashMap は meta.* を取り除いた重みだけを持つ。finetune はこれを学習用の Var に書き写す
+fn load_tensors(path: &Path, dev: &Device) -> Result<(HashMap<String, Tensor>, ModelConfig, Tokenizer)> {
 	let mut tensors = candle_core::safetensors::load(path, dev)
 		.map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
 	let mut take_meta = |key: &str| -> Result<Vec<u32>> {
@@ -626,19 +775,11 @@ fn load_model(path: &Path, dev: &Device) -> Result<(Gpt, ModelConfig, Tokenizer)
 			char::from_u32(v).ok_or_else(|| candle_core::Error::Msg(format!("{META_VOCAB} に不正な文字コード: {v}")))
 		})
 		.collect::<Result<Vec<char>>>()?;
-	let tok = Tokenizer::from_chars(itos);
-	// Var を経由せずテンソルから直接組むので、生成中に計算グラフは作られない
-	let model = Gpt::new(
-		&cfg,
-		tok.vocab_size(),
-		0.0,
-		VarBuilder::from_tensors(tensors, DType::F32, dev),
-	)?;
-	Ok((model, cfg, tok))
+	Ok((tensors, cfg, Tokenizer::from_chars(itos)))
 }
 
 #[derive(Parser)]
-#[command(version, about = "文字単位の最小 GPT を学習し、文章を生成する")]
+#[command(version, about = "文字単位の最小 GPT を学習し、文章の生成と対話を行う")]
 struct Cli {
 	/// CUDA が使える環境でも CPU で実行する
 	#[arg(long, global = true)]
@@ -652,20 +793,17 @@ struct Cli {
 enum Command {
 	/// テキストファイルでモデルを学習し、重みを保存する
 	Train(TrainArgs),
+	/// train で保存したモデルを会話データで追加学習し、対話用の重みを保存する
+	Finetune(FinetuneArgs),
 	/// 保存したモデルで文章を生成する
 	Generate(GenerateArgs),
+	/// finetune で保存したモデルと対話する
+	Chat(ChatArgs),
 }
 
+// train と finetune で共通の学習オプション
 #[derive(Args)]
-struct TrainArgs {
-	/// 学習データのテキストファイル
-	#[arg(default_value = "input.txt")]
-	data: PathBuf,
-
-	/// 検証データのテキストファイル（省略時は学習データの末尾 1 割を検証に回す）
-	#[arg(long)]
-	val: Option<PathBuf>,
-
+struct LoopArgs {
 	/// dropout 率（省略時は設定ごとの既定値）。データが十分大きく丸暗記が起きないなら 0 でよい
 	#[arg(long)]
 	dropout: Option<f32>,
@@ -677,14 +815,6 @@ struct TrainArgs {
 	/// 勾配ノルムの上限（省略時は設定ごとの既定値）。0 でクリップしない
 	#[arg(long)]
 	grad_clip: Option<f64>,
-
-	/// CPU で数十秒で終わる小さい設定を使う
-	#[arg(long)]
-	tiny: bool,
-
-	/// 学習済みモデルの保存先
-	#[arg(short, long, default_value = "model.safetensors")]
-	out: PathBuf,
 
 	/// 学習ステップ数（省略時は設定ごとの既定値）
 	#[arg(long)]
@@ -705,6 +835,87 @@ struct TrainArgs {
 	/// 色分け表示の描き直し間隔（step 数）。表示が止まっているときは使わない
 	#[arg(long, default_value_t = 10)]
 	viz_every: usize,
+}
+
+impl LoopArgs {
+	// 指定された値で cfg を上書きして検査し、色分け表示を使うかどうかを返す
+	fn apply(&self, cfg: &mut TrainConfig) -> Result<bool> {
+		if let Some(steps) = self.steps {
+			cfg.max_steps = steps;
+		}
+		if let Some(p) = self.dropout {
+			cfg.dropout = p;
+		}
+		if let Some(wd) = self.weight_decay {
+			cfg.weight_decay = wd;
+		}
+		if let Some(c) = self.grad_clip {
+			cfg.grad_clip = c;
+		}
+		cfg.validate()?;
+		// ファイルやパイプへのリダイレクト先と、エスケープシーケンスを解釈しない TERM=dumb の端末には、描き直しの制御コードを書き込まない
+		let use_viz =
+			!self.no_viz && std::io::stdout().is_terminal() && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
+		if use_viz && self.viz_every == 0 {
+			candle_core::bail!("--viz-every は 1 以上である必要がある");
+		}
+		Ok(use_viz)
+	}
+}
+
+#[derive(Args)]
+struct TrainArgs {
+	/// 学習データのテキストファイル
+	#[arg(default_value = "input.txt")]
+	data: PathBuf,
+
+	/// 検証データのテキストファイル（省略時は学習データの末尾 1 割を検証に回す）
+	#[arg(long)]
+	val: Option<PathBuf>,
+
+	/// CPU で数十秒で終わる小さい設定を使う
+	#[arg(long)]
+	tiny: bool,
+
+	/// 学習済みモデルの保存先
+	#[arg(short, long, default_value = "model.safetensors")]
+	out: PathBuf,
+
+	#[command(flatten)]
+	common: LoopArgs,
+}
+
+#[derive(Args)]
+struct FinetuneArgs {
+	/// 会話データの JSONL（1 行 1 会話。scripts/download-chat.bat で作れる）
+	#[arg(default_value = "data/chat-train.jsonl")]
+	data: PathBuf,
+
+	/// 検証用の会話データの JSONL（省略時は会話データの末尾 1 割を検証に回す）
+	#[arg(long)]
+	val: Option<PathBuf>,
+
+	/// train で保存した土台のモデルファイル。モデルの形と語彙はこのファイルから引き継ぐ
+	#[arg(long)]
+	base: PathBuf,
+
+	/// 会話データに混ぜる文章コーパスのテキストファイル。事前学習で得た文章力が失われるのを抑える。
+	/// テキストと ID 列を同時に持つので、ファイルの大きさの約 3 倍のメモリを使う
+	#[arg(long)]
+	mix: Option<PathBuf>,
+
+	/// 1 step の系列の本数のうち --mix の文章コーパスから取る割合。
+	/// 会話データは AI の発言の文字だけを loss に数えるので、loss に数える文字数に占める文章コーパスの割合はこの値より大きくなる
+	/// （会話データの約 7 割が AI の発言のとき、0.25 で約 3 割）
+	#[arg(long, default_value_t = 0.25, requires = "mix")]
+	mix_ratio: f64,
+
+	/// 追加学習したモデルの保存先
+	#[arg(short, long, default_value = "chat.safetensors")]
+	out: PathBuf,
+
+	#[command(flatten)]
+	common: LoopArgs,
 }
 
 #[derive(Args)]
@@ -730,6 +941,25 @@ struct GenerateArgs {
 	seed: Option<u64>,
 }
 
+#[derive(Args)]
+struct ChatArgs {
+	/// finetune で保存したモデルファイル
+	#[arg(short, long, default_value = "chat.safetensors")]
+	model: PathBuf,
+
+	/// 1 回の返事の最大文字数。返事の終わりの印が出なくてもこの文字数で打ち切る
+	#[arg(short = 'n', long, default_value_t = 300)]
+	max_len: usize,
+
+	/// 1 未満で確率の高い文字に寄り、1 より大きいとばらつく
+	#[arg(short, long, default_value_t = 0.8)]
+	temperature: f64,
+
+	/// 乱数シード（省略時は実行ごとに変わる）
+	#[arg(long)]
+	seed: Option<u64>,
+}
+
 fn select_device(cpu: bool) -> Result<Device> {
 	if cpu {
 		Ok(Device::Cpu)
@@ -738,97 +968,52 @@ fn select_device(cpu: bool) -> Result<Device> {
 	}
 }
 
-fn train(args: TrainArgs, dev: &Device) -> Result<()> {
-	let mut cfg = if args.tiny {
-		TrainConfig::tiny()
-	} else {
-		TrainConfig::gpu()
-	};
-	if let Some(steps) = args.steps {
-		cfg.max_steps = steps;
-	}
-	if let Some(p) = args.dropout {
-		cfg.dropout = p;
-	}
-	if let Some(wd) = args.weight_decay {
-		cfg.weight_decay = wd;
-	}
-	if let Some(c) = args.grad_clip {
-		cfg.grad_clip = c;
-	}
-	// 既定値を書き換えたときにも同じ条件で弾けるよう、指定の有無にかかわらず確かめる
-	if !(0.0..1.0).contains(&cfg.dropout) {
-		candle_core::bail!("--dropout は 0 以上 1 未満である必要がある: {}", cfg.dropout);
-	}
-	// 重みは毎 step (1 - lr * weight_decay) 倍されるので、負だと膨らみ続け、lr * weight_decay が 1 以上だと
-	// 1 step で 0 か符号反転になり、inf や NaN だと全重みが NaN になる
-	if !(cfg.weight_decay >= 0.0 && cfg.weight_decay * cfg.lr < 1.0) {
-		candle_core::bail!(
-			"--weight-decay は 0 以上で、lr ({}) との積が 1 未満である必要がある: {}",
-			cfg.lr,
-			cfg.weight_decay
-		);
-	}
-	// 負や NaN の上限ではクリップの判定が意味をなさない
-	if !(cfg.grad_clip >= 0.0 && cfg.grad_clip.is_finite()) {
-		candle_core::bail!("--grad-clip は 0 以上の有限値である必要がある: {}", cfg.grad_clip);
-	}
-	// ファイルやパイプへのリダイレクト先と、エスケープシーケンスを解釈しない TERM=dumb の端末には、描き直しの制御コードを書き込まない
-	let use_viz =
-		!args.no_viz && std::io::stdout().is_terminal() && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
-	if use_viz && args.viz_every == 0 {
-		candle_core::bail!("--viz-every は 1 以上である必要がある");
-	}
-	// 割り切れないと 1 step あたりの本数が batch_size より少なくなり、どちらかが 0 だと勾配が 1 つも作られないので、GPU を確保する前に弾く
-	if cfg.batch_size == 0 || cfg.micro_batch == 0 || cfg.batch_size % cfg.micro_batch != 0 {
-		candle_core::bail!(
-			"batch_size ({}) と micro_batch ({}) は 1 以上で、batch_size は micro_batch で割り切れる必要がある",
-			cfg.batch_size,
-			cfg.micro_batch
-		);
-	}
+fn read_text(path: &Path) -> Result<String> {
+	std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))
+}
 
-	let read = |path: &Path| {
-		std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))
-	};
-	let text = read(&args.data)?;
-	let val_text = args.val.as_deref().map(read).transpose()?;
-	// 検証データにしか出てこない文字があると encode が失敗するので、語彙は両方から作る
-	let texts: Vec<&str> = std::iter::once(text.as_str()).chain(val_text.as_deref()).collect();
-	let tok = Tokenizer::from_texts(&texts);
-	let data = tok.encode_corpus(&text)?;
-	let val_data = val_text.as_deref().map(|t| tok.encode_corpus(t)).transpose()?;
-	// 数 GB のテキストを ID 列と二重に持たないよう、encode し終えたら手放す
-	drop(texts);
-	drop(text);
-	drop(val_text);
-	let (train, val) = match &val_data {
-		Some(v) => (data.as_slice(), v.as_slice()),
-		// 学習に使っていない部分で測らないと、丸暗記しただけでも loss が下がって見えてしまう
-		None => data.split_at(data.len() * 9 / 10),
-	};
-	// get_batch は block_size + 1 文字の窓を取るので、どちらの区間もそれより長くないと範囲が空になる
-	if train.len().min(val.len()) <= cfg.model.block_size + 1 {
+// get_batch は block_size + 1 文字の窓を取るので、それより長くないと窓の開始位置の範囲が空になる
+fn ensure_len(what: &str, len: usize, block_size: usize) -> Result<()> {
+	if len <= block_size + 1 {
 		candle_core::bail!(
-			"{}{}: 学習データか検証データが短すぎる（学習 {} 文字 / 検証 {} 文字。どちらも block_size + 1 = {} 文字を超える必要がある）",
-			args.data.display(),
-			args.val
-				.as_ref()
-				.map(|p| format!(" / {}", p.display()))
-				.unwrap_or_default(),
-			train.len(),
-			val.len(),
-			cfg.model.block_size + 1
+			"{what} が短すぎる（{len} 文字。block_size + 1 = {} 文字を超える必要がある）",
+			block_size + 1
 		);
 	}
+	Ok(())
+}
 
-	let varmap = VarMap::new();
-	let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
-	let model = Gpt::new(&cfg.model, tok.vocab_size(), cfg.dropout, vb)?;
+// train と finetune で共通の学習ループに渡す値。重みの初期値とデータの用意は呼び出し側が行う
+struct Fit<'a> {
+	cfg: &'a TrainConfig,
+	tok: &'a Tokenizer,
+	// 空なら fit が Gpt::new の初期値で Var を作る。土台のモデルから始める場合は、呼び出し側が先に Var を作って値を書き込んでおく
+	varmap: &'a VarMap,
+	// 重みの更新に使う (抽出元, 抽出割合)
+	train: &'a [(Corpus<'a>, f64)],
+	// 評価ログの train loss を測るデータ。finetune では文章コーパスを含めず、val と同じく会話データの AI の返事の loss にする
+	train_eval: Corpus<'a>,
+	val: Corpus<'a>,
+	out: &'a Path,
+	// 色分け表示を使う場合の (描き直し間隔, 表示を始める位置の直前の文字)
+	viz: Option<(usize, Option<char>)>,
+	summary: String,
+}
+
+// 返り値は保存したモデルの val loss
+fn fit(f: Fit, rng: &mut StdRng, dev: &Device) -> Result<f32> {
+	let cfg = f.cfg;
+	let model = Gpt::new(
+		&cfg.model,
+		f.tok.vocab_size(),
+		cfg.dropout,
+		VarBuilder::from_varmap(f.varmap, DType::F32, dev),
+	)?;
 	// Var から計算した結果は逆伝播用に入力への参照を持ち続けるので、forward だけでも中間テンソルが最後まで解放されない。
 	// 評価と生成は逆伝播しないので、detach した重みで同じ構造のモデルをもう 1 つ組んでそちらを使う。
 	// detach は Var と同じストレージを指し、AdamW の更新（Var::set）はストレージを書き換えるので、毎 step の重みがそのまま見える
-	let detached: HashMap<String, Tensor> = varmap
+	let detached: HashMap<String, Tensor> = f
+		.varmap
 		.data()
 		.lock()
 		.unwrap()
@@ -837,25 +1022,18 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		.collect();
 	let eval_model = Gpt::new(
 		&cfg.model,
-		tok.vocab_size(),
+		f.tok.vocab_size(),
 		0.0,
 		VarBuilder::from_tensors(detached, DType::F32, dev),
 	)?;
-	let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-	let summary = format!(
-		"device: {:?} / chars: train {} + val {} / vocab: {} / params: {:.2}M",
-		dev,
-		train.len(),
-		val.len(),
-		tok.vocab_size(),
-		n_params as f64 / 1e6
-	);
+	let n_params: usize = f.varmap.all_vars().iter().map(|v| v.elem_count()).sum();
+	let summary = format!("{} / params: {:.2}M", f.summary, n_params as f64 / 1e6);
 	println!("{summary}");
 
 	let mut opt = ParamGroups::new(
-		varmap.all_vars(),
+		f.varmap.all_vars(),
 		ParamsAdamW {
-			lr: lr_at(&cfg, 0),
+			lr: lr_at(cfg, 0),
 			// 1 step あたりのトークン数が少なく勾配のばらつきが大きいので、nanoGPT の Shakespeare 設定に合わせて
 			// 2 次モーメントの平均を既定の 0.999 より短い期間で取る
 			beta2: 0.99,
@@ -864,14 +1042,16 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		},
 	)?;
 	// 勾配が全パラメータに届いているかの検査に使う
-	let vars: Vec<Tensor> = varmap.all_vars().iter().map(|v| v.as_tensor().clone()).collect();
-	let mut rng = StdRng::seed_from_u64(args.seed);
+	let vars: Vec<Tensor> = f.varmap.all_vars().iter().map(|v| v.as_tensor().clone()).collect();
 	let t0 = Instant::now();
 	// 最終 step の重みは過学習で val loss 最小時より悪化しうるので、val loss が最小値を更新するたびに保存する
 	let mut best_val = f32::INFINITY;
 	// 直前の step のクリップ前の勾配ノルム。評価ログに出し、クリップがどのくらいの頻度で効いているかの目安にする
 	let mut grad_norm: Option<f32> = None;
-	let mut viz = use_viz.then(|| Viz::new(&tok, cfg.model.block_size, val)).transpose()?;
+	let mut viz = f
+		.viz
+		.map(|(_, start_after)| Viz::new(f.tok, cfg.model.block_size, f.val.ids, start_after))
+		.transpose()?;
 	// Viz::new が画面を消すので、学習後に出力する評価ログの先頭に同じ行を入れる
 	if let Some(v) = &mut viz {
 		v.push_log(summary);
@@ -879,12 +1059,12 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 
 	for step in 0..=cfg.max_steps {
 		if step % cfg.eval_interval == 0 || step == cfg.max_steps {
-			let tr = estimate_loss(&eval_model, train, &cfg, &mut rng, dev)?;
-			let va = estimate_loss(&eval_model, val, &cfg, &mut rng, dev)?;
+			let tr = estimate_loss(&eval_model, f.train_eval, cfg, rng, dev)?;
+			let va = estimate_loss(&eval_model, f.val, cfg, rng, dev)?;
 			let improved = va < best_val;
 			if improved {
 				best_val = va;
-				save_model(&args.out, &varmap, &cfg.model, &tok)?;
+				save_model(f.out, f.varmap, &cfg.model, f.tok)?;
 			}
 			let line = format!(
 				"step {step:5} | train {tr:.4} | val {va:.4} | lr {:.2e} | gnorm {} | {:.1}s{}",
@@ -899,8 +1079,8 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 				None => println!("{line}"),
 			}
 		}
-		if let Some(v) = &viz
-			&& (step % args.viz_every == 0 || step == cfg.max_steps)
+		if let (Some(v), Some((every, _))) = (&viz, f.viz)
+			&& (step % every == 0 || step == cfg.max_steps)
 		{
 			let progress = format!(
 				"step {step:5}/{} | lr {:.2e} | {:.1}s",
@@ -914,13 +1094,19 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			break;
 		}
 		// loss を下げるには各重みをどちらにどれだけ動かせばいいかを、逆伝播で全パラメータ分まとめて求める。
-		// micro_batch ずつ backward して勾配を足し合わせる。各 loss を回数で割っておけば、合計は batch_size 本の平均 loss の勾配と同じになる。
+		// micro_batch ずつ backward して勾配を足し合わせる。各 loss を 1 step 分の対象文字数で割っておけば、
+		// 合計は batch_size 本の全対象文字の平均 loss の勾配と同じになる。
 		// loss（計算グラフ）は 1 回ごとに捨てるので、同時に VRAM に載る中間テンソルは micro_batch 本ぶんだけで済む
 		let grad_accum = cfg.batch_size / cfg.micro_batch;
+		let batches = (0..grad_accum)
+			.map(|_| get_batch(f.train, cfg.micro_batch, cfg.model.block_size, rng, dev))
+			.collect::<Result<Vec<_>>>()?;
+		// finetune は AI の発言が無い会話データを事前に弾くが、ランダムな窓が偶然すべて User の発言に収まる step はありうる。
+		// その step は 0 除算を避けて loss と勾配を 0 にし、AdamW は weight decay だけを掛ける
+		let n_targets = batches.iter().map(|b| b.n_targets).sum::<f64>().max(1.0);
 		let mut grads = GradStore::default();
-		for _ in 0..grad_accum {
-			let (x, y) = get_batch(train, cfg.micro_batch, cfg.model.block_size, &mut rng, dev)?;
-			let loss = (compute_loss(&model, &x, &y)? / grad_accum as f64)?;
+		for batch in &batches {
+			let loss = (loss_sum(&model, batch)? / n_targets)?;
 			// extend は同じ TensorId の勾配を足し合わせ、無ければそのまま入れる
 			grads.extend(loss.backward()?)?;
 		}
@@ -937,7 +1123,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			.map_err(|e| candle_core::Error::Msg(format!("step {step}: {e}")))?;
 		grad_norm = Some(norm);
 		// 勾配そのままだと重みごとにスケールがばらばらなので、AdamW で過去の勾配の平均と大きさを使って歩幅を揃えて更新する
-		opt.set_learning_rate(lr_at(&cfg, step));
+		opt.set_learning_rate(lr_at(cfg, step));
 		opt.step(&grads)?;
 	}
 
@@ -948,24 +1134,340 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			println!("{line}");
 		}
 	}
-	println!("best val {best_val:.4}: {}", args.out.display());
+	println!("best val {best_val:.4}: {}", f.out.display());
+	Ok(best_val)
+}
 
-	if args.sample_len > 0 {
+fn train(args: TrainArgs, dev: &Device) -> Result<()> {
+	let mut cfg = if args.tiny {
+		TrainConfig::tiny()
+	} else {
+		TrainConfig::gpu()
+	};
+	let use_viz = args.common.apply(&mut cfg)?;
+
+	let text = read_text(&args.data)?;
+	let val_text = args.val.as_deref().map(read_text).transpose()?;
+	// 検証データにしか出てこない文字があると encode が失敗するので、語彙は両方から作る
+	let texts: Vec<&str> = std::iter::once(text.as_str()).chain(val_text.as_deref()).collect();
+	let tok = Tokenizer::from_texts(&texts);
+	let data = tok.encode_corpus(&text)?;
+	let val_data = val_text.as_deref().map(|t| tok.encode_corpus(t)).transpose()?;
+	// 数 GB のテキストを ID 列と二重に持たないよう、encode し終えたら手放す
+	drop(texts);
+	drop(text);
+	drop(val_text);
+	let (train, val) = match &val_data {
+		Some(v) => (data.as_slice(), v.as_slice()),
+		// 学習に使っていない部分で測らないと、丸暗記しただけでも loss が下がって見えてしまう
+		None => data.split_at(data.len() * 9 / 10),
+	};
+	let block = cfg.model.block_size;
+	ensure_len(&format!("学習データ {}", args.data.display()), train.len(), block)?;
+	match &args.val {
+		Some(p) => ensure_len(&format!("検証データ {}", p.display()), val.len(), block)?,
+		None => ensure_len(
+			&format!("検証データ（{} の末尾 1 割）", args.data.display()),
+			val.len(),
+			block,
+		)?,
+	}
+
+	let varmap = VarMap::new();
+	let mut rng = StdRng::seed_from_u64(args.common.seed);
+	let summary = format!(
+		"device: {:?} / chars: train {} + val {} / vocab: {}",
+		dev,
+		train.len(),
+		val.len(),
+		tok.vocab_size()
+	);
+	fit(
+		Fit {
+			cfg: &cfg,
+			tok: &tok,
+			varmap: &varmap,
+			train: &[(Corpus::plain(train), 1.0)],
+			train_eval: Corpus::plain(train),
+			val: Corpus::plain(val),
+			out: &args.out,
+			viz: use_viz.then_some((args.common.viz_every, Some('\n'))),
+			summary,
+		},
+		&mut rng,
+		dev,
+	)?;
+
+	if args.common.sample_len > 0 {
 		// eval_model は最終 step の重みを参照するので、保存済みファイルと同じ重みで生成するために読み直す
 		let (best_model, _, _) = load_model(&args.out, dev)?;
 		let out = generate(
 			&best_model,
 			&[0],
-			args.sample_len,
+			args.common.sample_len,
 			0.8,
-			cfg.model.block_size,
+			block,
 			&mut rng,
 			dev,
-			|_| Ok(()),
+			|_| Ok(ControlFlow::Continue(())),
 		)?;
 		println!("----\n{}", tok.decode(&out));
 	}
 	Ok(())
+}
+
+// 土台のモデルの重みを varmap の Var に書き写す。
+// 語彙を足した分の wte と lm_head の行は、Gpt::new の初期値（平均 0・標準偏差 0.02 の正規分布）のまま残す
+fn init_from_base(
+	varmap: &VarMap,
+	mut base: HashMap<String, Tensor>,
+	cfg: &ModelConfig,
+	base_vocab: usize,
+	vocab: usize,
+	dev: &Device,
+) -> Result<()> {
+	Gpt::new(cfg, vocab, 0.0, VarBuilder::from_varmap(varmap, DType::F32, dev))?;
+	for (name, var) in varmap.data().lock().unwrap().iter() {
+		let src = base
+			.remove(name)
+			.ok_or_else(|| candle_core::Error::Msg(format!("土台のモデルに {name} が無い")))?;
+		// 行 i は ID i の文字に対応する。Tokenizer::extended は既存の ID を変えないので、末尾に新しい行を足すだけで対応が保たれる
+		let src = if (name == "wte.weight" || name == "lm_head.weight") && vocab > base_vocab {
+			Tensor::cat(&[&src, &var.as_tensor().narrow(0, base_vocab, vocab - base_vocab)?], 0)?
+		} else {
+			src
+		};
+		var.set(&src)
+			.map_err(|e| candle_core::Error::Msg(format!("{name}: {e}")))?;
+	}
+	if let Some(name) = base.keys().next() {
+		candle_core::bail!("土台のモデルに、このモデルの構造に無い重み {name} がある");
+	}
+	Ok(())
+}
+
+fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
+	if !(0.0..1.0).contains(&args.mix_ratio) {
+		candle_core::bail!("--mix-ratio は 0 以上 1 未満である必要がある: {}", args.mix_ratio);
+	}
+	let (base, model_cfg, base_tok) = load_tensors(&args.base, dev)?;
+	let mut cfg = TrainConfig::finetune(model_cfg);
+	let use_viz = args.common.apply(&mut cfg)?;
+
+	let mut convs = chat::load_jsonl(&args.data)?;
+	let val_convs = match &args.val {
+		Some(p) => chat::load_jsonl(p)?,
+		// 学習に使っていない会話で測らないと、丸暗記しただけでも loss が下がって見えてしまう
+		None => {
+			if convs.len() < 2 {
+				candle_core::bail!(
+					"{}: 検証に回す会話が無い（会話が 1 つだけ）。--val を指定する",
+					args.data.display()
+				);
+			}
+			let n = (convs.len() / 10).max(1);
+			convs.split_off(convs.len() - n)
+		}
+	};
+	let (text, mask) = chat::render(&convs);
+	let (val_text, val_mask) = chat::render(&val_convs);
+	// AI の発言が無いと loss に数える文字が 0 になり、学習も評価も成り立たない
+	let val_name = args
+		.val
+		.as_ref()
+		.map_or_else(|| "検証用の会話データ".to_string(), |p| p.display().to_string());
+	for (name, m) in [(args.data.display().to_string(), &mask), (val_name, &val_mask)] {
+		if !m.contains(&true) {
+			candle_core::bail!("{name}: AI（assistant）の発言が 1 つも無い");
+		}
+	}
+	if args.mix.is_none() {
+		eprintln!("--mix を指定していないので、会話データだけで学習する。事前学習で得た文章力は失われていく");
+	}
+	let mix_text = args.mix.as_deref().map(read_text).transpose()?;
+	// 区切りの印と、土台の語彙に無い文字（会話データにだけ出てくる記号など）を語彙の末尾に足す
+	let markers: String = chat::MARKERS.iter().collect();
+	let texts: Vec<&str> = [markers.as_str(), text.as_str(), val_text.as_str()]
+		.into_iter()
+		.chain(mix_text.as_deref())
+		.collect();
+	let tok = base_tok.extended(&texts);
+	drop(texts);
+	let data = tok.encode_corpus(&text)?;
+	let val_data = tok.encode_corpus(&val_text)?;
+	let mix_data = mix_text.as_deref().map(|t| tok.encode_corpus(t)).transpose()?;
+	drop(mix_text);
+
+	let block = cfg.model.block_size;
+	ensure_len(&format!("会話データ {}", args.data.display()), data.len(), block)?;
+	ensure_len("検証用の会話データ", val_data.len(), block)?;
+	if let (Some(p), Some(m)) = (&args.mix, &mix_data) {
+		ensure_len(&format!("文章コーパス {}", p.display()), m.len(), block)?;
+	}
+
+	let varmap = VarMap::new();
+	init_from_base(&varmap, base, &cfg.model, base_tok.vocab_size(), tok.vocab_size(), dev)?;
+
+	let chat_train = Corpus {
+		ids: &data,
+		mask: Some(&mask),
+	};
+	let chat_val = Corpus {
+		ids: &val_data,
+		mask: Some(&val_mask),
+	};
+	let mut sources = vec![(chat_train, 1.0 - args.mix_ratio)];
+	if let Some(m) = &mix_data {
+		sources.push((Corpus::plain(m), args.mix_ratio));
+	}
+	let mut rng = StdRng::seed_from_u64(args.common.seed);
+	let summary = format!(
+		"device: {:?} / base: {} / vocab: {} → {} / conversations: train {} + val {} / chars: train {} + val {}{}",
+		dev,
+		args.base.display(),
+		base_tok.vocab_size(),
+		tok.vocab_size(),
+		convs.len(),
+		val_convs.len(),
+		data.len(),
+		val_data.len(),
+		mix_data
+			.as_ref()
+			.map(|m| format!(" / mix: {} chars × {}", m.len(), args.mix_ratio))
+			.unwrap_or_default()
+	);
+	fit(
+		Fit {
+			cfg: &cfg,
+			tok: &tok,
+			varmap: &varmap,
+			train: &sources,
+			train_eval: chat_train,
+			val: chat_val,
+			out: &args.out,
+			viz: use_viz.then_some((args.common.viz_every, None)),
+			summary,
+		},
+		&mut rng,
+		dev,
+	)?;
+
+	// 検証用の最初の会話の最初の User の発言に返事をさせ、学習結果の目安として表示する
+	let first_user = val_convs
+		.iter()
+		.flat_map(|c| &c.messages)
+		.find(|m| m.role == chat::Role::User);
+	if args.common.sample_len > 0
+		&& let Some(m) = first_user
+	{
+		let (best_model, _, _) = load_model(&args.out, dev)?;
+		let ids = ChatIds::new(&tok, &args.out)?;
+		let mut history = Vec::new();
+		ids.push_user(&tok, &mut history, &m.content)?;
+		let mut reply = Vec::new();
+		ids.reply(
+			&best_model,
+			&mut history,
+			args.common.sample_len,
+			0.8,
+			block,
+			&mut rng,
+			dev,
+			|id| {
+				reply.push(id);
+				Ok(())
+			},
+		)?;
+		println!("----\nUser: {}\nAI: {}", m.content, tok.decode(&reply));
+	}
+	Ok(())
+}
+
+// 会話の区切りの印の ID。印は finetune で語彙に足すので、train だけのモデルには無い
+struct ChatIds {
+	user: u32,
+	assistant: u32,
+	end: u32,
+}
+
+impl ChatIds {
+	fn new(tok: &Tokenizer, model_path: &Path) -> Result<Self> {
+		let [user, assistant, end] = chat::MARKERS.map(|c| tok.stoi.get(&c).copied());
+		let (Some(user), Some(assistant), Some(end)) = (user, assistant, end) else {
+			candle_core::bail!(
+				"{}: 会話の区切りの印が語彙に無い。finetune で追加学習したモデルを指定する",
+				model_path.display()
+			);
+		};
+		Ok(Self { user, assistant, end })
+	}
+
+	// User の発言を履歴に足し、続けて AI の発言の印を置いて返事を生成できる状態にする。
+	// 語彙に無い文字や区切りの印を含む発言はエラーにし、履歴は変えない
+	fn push_user(&self, tok: &Tokenizer, history: &mut Vec<u32>, text: &str) -> Result<()> {
+		if text.contains(chat::MARKERS) {
+			candle_core::bail!("会話の区切り用の文字（U+E000〜U+E002）は入力できない");
+		}
+		let ids = tok.encode(text)?;
+		history.push(self.user);
+		history.extend(ids);
+		history.extend([self.end, self.assistant]);
+		Ok(())
+	}
+
+	// history の末尾に AI の返事を生成して書き足す。区切りの印のいずれかが出るか max_len 文字に達したら止め、
+	// どの場合も history の末尾を終わりの印にして、次の User の発言を続けられる形にする。
+	// 終わりの印以外の印（User や AI の発言の開始）は返事の中に置く位置が無いので、終わりの印に置き換える。
+	// on_char は返事の文字ごとに呼ばれ、印では呼ばれない
+	#[allow(clippy::too_many_arguments)]
+	fn reply(
+		&self,
+		model: &Gpt,
+		history: &mut Vec<u32>,
+		max_len: usize,
+		temperature: f64,
+		block_size: usize,
+		rng: &mut StdRng,
+		dev: &Device,
+		mut on_char: impl FnMut(u32) -> Result<()>,
+	) -> Result<()> {
+		// generate は直近 block_size 文字だけを文脈にするので、そのままでは文脈が発言の途中から始まることがある。
+		// 文脈に収まる範囲で最も古い User の発言の開始位置より前を捨て、発言の境界から始まる文脈にする。
+		// 収まる範囲に User の発言の開始が無い場合（最後の発言だけで block_size を超える）は捨てずに渡す
+		if history.len() > block_size {
+			let from = history.len() - block_size;
+			if let Some(i) = history[from..].iter().position(|&id| id == self.user) {
+				history.drain(..from + i);
+			}
+		}
+		let out = generate(model, history, max_len, temperature, block_size, rng, dev, |id| {
+			if self.is_marker(id) {
+				return Ok(ControlFlow::Break(()));
+			}
+			on_char(id)?;
+			Ok(ControlFlow::Continue(()))
+		})?;
+		*history = out;
+		if history.last().is_some_and(|&id| self.is_marker(id)) {
+			history.pop();
+		}
+		history.push(self.end);
+		Ok(())
+	}
+
+	fn is_marker(&self, id: u32) -> bool {
+		[self.user, self.assistant, self.end].contains(&id)
+	}
+}
+
+fn io_err(e: std::io::Error) -> candle_core::Error {
+	candle_core::Error::Msg(e.to_string())
+}
+
+// 区切りの印は私用領域の文字で字形が無いので、端末には User: / AI: の表記で出す
+fn printable(tok: &Tokenizer, id: u32) -> String {
+	let c = tok.itos[id as usize];
+	chat::label(c).map_or_else(|| c.to_string(), str::to_string)
 }
 
 fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
@@ -986,8 +1488,9 @@ fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
 	let mut rng = StdRng::seed_from_u64(seed);
 
 	let mut stdout = std::io::stdout().lock();
-	let io_err = |e: std::io::Error| candle_core::Error::Msg(e.to_string());
-	write!(stdout, "{}", tok.decode(&start)).map_err(io_err)?;
+	for &id in &start {
+		write!(stdout, "{}", printable(&tok, id)).map_err(io_err)?;
+	}
 	stdout.flush().map_err(io_err)?;
 	generate(
 		&model,
@@ -998,11 +1501,79 @@ fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
 		&mut rng,
 		dev,
 		|id| {
-			write!(stdout, "{}", tok.decode(&[id])).map_err(io_err)?;
-			stdout.flush().map_err(io_err)
+			write!(stdout, "{}", printable(&tok, id)).map_err(io_err)?;
+			stdout.flush().map_err(io_err)?;
+			Ok(ControlFlow::Continue(()))
 		},
 	)?;
 	writeln!(stdout).map_err(io_err)?;
+	Ok(())
+}
+
+fn chat_cmd(args: ChatArgs, dev: &Device) -> Result<()> {
+	// temperature で logits を割るので、0 以下だと確率分布にならない
+	if !(args.temperature > 0.0) {
+		candle_core::bail!("temperature は 0 より大きい必要がある: {}", args.temperature);
+	}
+	let (model, cfg, tok) = load_model(&args.model, dev)?;
+	let ids = ChatIds::new(&tok, &args.model)?;
+	let seed = args.seed.unwrap_or_else(rand::random);
+	if args.seed.is_none() {
+		eprintln!("seed: {seed}");
+	}
+	let mut rng = StdRng::seed_from_u64(seed);
+	// generate は直近の block_size 文字だけを文脈にするので、それより前の発言は返事に反映されない
+	eprintln!(
+		"/reset で会話を消去、/exit か空行で終了。返事の生成に使うのは直近の {} 文字まで",
+		cfg.block_size
+	);
+
+	let mut stdout = std::io::stdout();
+	let mut lines = std::io::stdin().lock().lines();
+	let mut history = Vec::new();
+	loop {
+		write!(stdout, "User: ").map_err(io_err)?;
+		stdout.flush().map_err(io_err)?;
+		let Some(line) = lines.next() else {
+			writeln!(stdout).map_err(io_err)?;
+			break;
+		};
+		let line = line.map_err(io_err)?;
+		let text = line.trim();
+		match text {
+			"" | "/exit" => {
+				writeln!(stdout).map_err(io_err)?;
+				break;
+			}
+			"/reset" => {
+				history.clear();
+				writeln!(stdout, "（会話を消去した）").map_err(io_err)?;
+				continue;
+			}
+			_ => {}
+		}
+		// 入力の誤りで対話を終了させないよう、エラーを表示して次の入力を待つ
+		if let Err(e) = ids.push_user(&tok, &mut history, text) {
+			writeln!(stdout, "{e}").map_err(io_err)?;
+			continue;
+		}
+		write!(stdout, "AI: ").map_err(io_err)?;
+		stdout.flush().map_err(io_err)?;
+		ids.reply(
+			&model,
+			&mut history,
+			args.max_len,
+			args.temperature,
+			cfg.block_size,
+			&mut rng,
+			dev,
+			|id| {
+				write!(stdout, "{}", printable(&tok, id)).map_err(io_err)?;
+				stdout.flush().map_err(io_err)
+			},
+		)?;
+		writeln!(stdout).map_err(io_err)?;
+	}
 	Ok(())
 }
 
@@ -1011,6 +1582,8 @@ fn main() -> Result<()> {
 	let dev = select_device(cli.cpu)?;
 	match cli.command {
 		Command::Train(args) => train(args, &dev),
+		Command::Finetune(args) => finetune(args, &dev),
 		Command::Generate(args) => generate_cmd(args, &dev),
+		Command::Chat(args) => chat_cmd(args, &dev),
 	}
 }

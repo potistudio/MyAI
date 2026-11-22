@@ -10,6 +10,8 @@ candle-core = "0.11.1"
 candle-nn = "0.11.1"
 clap = { version = "4.6.9", features = ["derive"] }
 rand = "0.10.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # candle-kernels 0.11.1 の compatibility.cuh は __CUDA_ARCH__ 未定義のホストパスでも
 # double atomicAdd シムを定義し、CUDA 13.x の sm_60_atomic_functions.h と衝突する。
