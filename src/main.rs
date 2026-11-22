@@ -704,7 +704,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		VarBuilder::from_tensors(detached, DType::F32, dev),
 	)?;
 	let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-	println!(
+	let summary = format!(
 		"device: {:?} / chars: train {} + val {} / vocab: {} / params: {:.2}M",
 		dev,
 		train.len(),
@@ -712,6 +712,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		tok.vocab_size(),
 		n_params as f64 / 1e6
 	);
+	println!("{summary}");
 
 	let mut opt = AdamW::new(
 		varmap.all_vars(),
@@ -733,6 +734,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		.viz
 		.then(|| Viz::new(&tok, cfg.model.block_size, val))
 		.transpose()?;
+	// Viz::new が画面を消すので、学習後に出力する評価ログの先頭に同じ行を入れる
+	if let Some(v) = &mut viz {
+		v.push_log(summary);
+	}
 
 	for step in 0..=cfg.max_steps {
 		if step % cfg.eval_interval == 0 || step == cfg.max_steps {

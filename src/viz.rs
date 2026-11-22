@@ -94,7 +94,9 @@ impl<'a> Viz<'a> {
 			.gather(&y, 1)?
 			.flatten_all()?
 			.to_vec1::<f32>()?;
-		let loss = probs.iter().map(|p| -p.ln()).sum::<f32>() / n as f32;
+		// f32 の softmax は確率が 0 に丸められることがあり、そのまま ln を取ると loss が inf になる。
+		// clamp は NaN を NaN のまま返すので、重みが NaN になった場合は表示の loss も NaN になる
+		let loss = probs.iter().map(|p| -p.clamp(f32::MIN_POSITIVE, 1.0).ln()).sum::<f32>() / n as f32;
 		let hits = probs.iter().filter(|&&p| p >= 0.5).count();
 
 		let mut lines = vec![
@@ -108,11 +110,14 @@ impl<'a> Viz<'a> {
 			),
 			String::new(),
 		];
-		// 先頭の 1 文字は予測の対象ではないので塗らない
-		let mut line = visible_cell(self.tok.itos[self.sample[0] as usize]).to_string();
-		for (&id, &p) in self.sample[1..=n].iter().zip(&probs) {
+		let mut line = String::new();
+		for (i, &id) in self.sample[..=n].iter().enumerate() {
 			let c = self.tok.itos[id as usize];
-			line.push_str(&paint(visible_cell(c), p));
+			// 先頭の 1 文字は予測の対象ではないので塗らない
+			match i.checked_sub(1) {
+				Some(j) => line.push_str(&paint(visible_cell(c), probs[j])),
+				None => line.push(visible_cell(c)),
+			}
 			if c == '\n' {
 				lines.push(std::mem::take(&mut line));
 			}
@@ -122,9 +127,14 @@ impl<'a> Viz<'a> {
 	}
 }
 
-// 背景色で塗るので、空白は空白のままでも位置が見える。改行だけ記号に置き換える
+// 背景色で塗るので、空白は空白のままでも位置が見える。改行は記号に置き換える。
+// それ以外の制御文字（CRLF の \r、タブ、ESC など）はカーソル移動や描画の崩れを起こすので、1 文字幅の記号に置き換える
 fn visible_cell(c: char) -> char {
-	if c == '\n' { '↵' } else { c }
+	match c {
+		'\n' => '↵',
+		c if c.is_control() => '·',
+		c => c,
+	}
 }
 
 // 確率 0 を暗い灰色、1 を明るい黄色とし、その間を線形に補間した 24 bit カラーの背景で文字を描く。
