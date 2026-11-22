@@ -10,7 +10,7 @@
 //!   → ln_f → lm_head で語彙ごとのスコア（logits）→ softmax で次の文字の確率
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -583,11 +583,11 @@ struct TrainArgs {
 	#[arg(long, default_value_t = 500)]
 	sample_len: usize,
 
-	/// 学習中、検証データの文章を各文字の予測の当たり具合で色分けして描き続ける
+	/// 予測の当たり具合で検証データを色分けする表示を止め、評価ログを 1 行ずつ流す（標準出力が端末でないときは指定しなくても止まる）
 	#[arg(long)]
-	viz: bool,
+	no_viz: bool,
 
-	/// --viz の描き直し間隔（step 数）
+	/// 色分け表示の描き直し間隔（step 数）。表示が止まっているときは使わない
 	#[arg(long, default_value_t = 10)]
 	viz_every: usize,
 }
@@ -638,7 +638,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		}
 		cfg.dropout = p;
 	}
-	if args.viz_every == 0 {
+	// ファイルやパイプへのリダイレクト先と、エスケープシーケンスを解釈しない TERM=dumb の端末には、描き直しの制御コードを書き込まない
+	let use_viz =
+		!args.no_viz && std::io::stdout().is_terminal() && std::env::var_os("TERM").is_none_or(|t| t != "dumb");
+	if use_viz && args.viz_every == 0 {
 		candle_core::bail!("--viz-every は 1 以上である必要がある");
 	}
 	// 割り切れないと 1 step あたりの本数が batch_size より少なくなり、どちらかが 0 だと勾配が 1 つも作られないので、GPU を確保する前に弾く
@@ -730,10 +733,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let t0 = Instant::now();
 	// 最終 step の重みは過学習で val loss 最小時より悪化しうるので、val loss が最小値を更新するたびに保存する
 	let mut best_val = f32::INFINITY;
-	let mut viz = args
-		.viz
-		.then(|| Viz::new(&tok, cfg.model.block_size, val))
-		.transpose()?;
+	let mut viz = use_viz.then(|| Viz::new(&tok, cfg.model.block_size, val)).transpose()?;
 	// Viz::new が画面を消すので、学習後に出力する評価ログの先頭に同じ行を入れる
 	if let Some(v) = &mut viz {
 		v.push_log(summary);
