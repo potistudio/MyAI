@@ -1,0 +1,24 @@
+[package]
+name = "my-ai"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+candle-core = "0.11.1"
+candle-nn = "0.11.1"
+rand = "0.10.4"
+
+# candle-kernels 0.11.1 の compatibility.cuh は __CUDA_ARCH__ 未定義のホストパスでも
+# double atomicAdd シムを定義し、CUDA 13.x の sm_60_atomic_functions.h と衝突する。
+# vendor/candle-kernels にガード修正を加えた複製を置いている。
+[patch.crates-io]
+candle-kernels = { path = "vendor/candle-kernels" }
+
+[features]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

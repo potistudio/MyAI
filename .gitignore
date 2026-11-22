@@ -1,5 +1,11 @@
 # macOS dummy file
 .DS_Store
 
+# Artifacts
+/target/
+
+# Logs
+*.log
+
 # Personal references
 refs/

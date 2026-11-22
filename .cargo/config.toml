@@ -1,0 +1,16 @@
+# CUDA ビルドの固定設定。
+# candle-kernels の build script は cudaforge 経由で nvcc を起動する。
+[env]
+# RTX 3060 (sm_86) 向けに 1 アーキテクチャのみ生成し、-gencode を確定させる。
+# 未指定時の自動検出も nvidia-smi から 8.6 を返すが、明示した方が再現性が高い。
+CUDA_COMPUTE_CAP = "86"
+# MSVC 14.4x 以降の cl.exe は CCCL が要求する標準準拠プリプロセッサ (/Zc:preprocessor)
+# を既定では使わないため、nvcc 経由で明示的に渡す。C4819 はコードページ 932 環境の
+# ヘッダ由来の警告で、ビルド結果に影響しない。
+# /MD は Rust (MSVC ターゲット) 既定の動的 CRT に合わせるための指定。未指定だと
+# libmoe が /MT でビルドされ、リンク時に LNK4098 (LIBCMT の競合) が出る。
+NVCC_APPEND_FLAGS = "-Xcompiler=/Zc:preprocessor -Xcompiler=/wd4819 -Xcompiler=/MD"
+
+# 注: リンク時に LNK4098 (defaultlib 'LIBCMT' の競合) が 1 件出るが、原因は NVIDIA 提供の
+# cuda.lib (ドライバ API スタブ) 側の /DEFAULTLIB:LIBCMT であり、本クレート側では制御できない。
+# 実オブジェクトと Rust 側は /MD に統一済みで、MSVCRT で解決される。ビルド・実行に支障はない。
