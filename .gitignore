@@ -9,3 +9,6 @@
 
 # Personal references
 refs/
+
+# Corpora (scripts/download-tinystories.bat)
+/data/

@@ -9,7 +9,7 @@
 //!   → Block × N（Attention で過去から情報を集め、MLP で加工し、残差に書き足す）
 //!   → ln_f → lm_head で語彙ごとのスコア（logits）→ softmax で次の文字の確率
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -137,9 +137,19 @@ struct Tokenizer {
 }
 
 impl Tokenizer {
-	fn from_text(text: &str) -> Self {
-		// ID の割り当てを実行ごとに変えたくないので、ソート済みの集合から作る
-		Self::from_chars(text.chars().collect::<BTreeSet<_>>().into_iter().collect())
+	fn from_texts(texts: &[&str]) -> Self {
+		// 数 GB のコーパスでも 1 パスで速く終わるよう、集合ではなく文字コードで直接引けるフラグ表に出現を記録する
+		let mut seen = vec![false; char::MAX as usize + 1];
+		for c in texts.iter().flat_map(|t| t.chars()) {
+			seen[c as usize] = true;
+		}
+		// ID の割り当てを実行ごとに変えたくないので、文字コード順に並べる
+		Self::from_chars(
+			(0..seen.len() as u32)
+				.filter(|&i| seen[i as usize])
+				.filter_map(char::from_u32)
+				.collect(),
+		)
 	}
 
 	// 学習時と同じ ID 割り当てを再現するため、保存しておいた itos の並びから組み直す
@@ -162,6 +172,29 @@ impl Tokenizer {
 					.ok_or_else(|| candle_core::Error::Msg(format!("語彙に無い文字: {c:?}")))
 			})
 			.collect()
+	}
+
+	// コーパス全体の ID 列は数十億要素になりうるので、u16 で持ってメモリを u32 の半分に抑える。
+	// 1 文字ごとの HashMap 引きも数十億回だと遅いので、文字コードで直接引ける表を使う
+	fn encode_corpus(&self, s: &str) -> Result<Vec<u16>> {
+		// u16::MAX は表の「語彙に無い」印に使うので、ID は u16::MAX 未満に収まる必要がある
+		if self.vocab_size() > u16::MAX as usize {
+			candle_core::bail!("語彙が {} 文字あり、u16 の ID に収まらない", self.vocab_size());
+		}
+		let mut lut = vec![u16::MAX; char::MAX as usize + 1];
+		for (i, &c) in self.itos.iter().enumerate() {
+			lut[c as usize] = i as u16;
+		}
+		// 文字数はバイト数以下なので、バイト数で確保すれば途中で再確保（一時的に 2 倍のメモリを使う）が起きない
+		let mut ids = Vec::with_capacity(s.len());
+		for c in s.chars() {
+			match lut[c as usize] {
+				u16::MAX => candle_core::bail!("語彙に無い文字: {c:?}"),
+				id => ids.push(id),
+			}
+		}
+		ids.shrink_to_fit();
+		Ok(ids)
 	}
 
 	fn decode(&self, ids: &[u32]) -> String {
@@ -367,15 +400,15 @@ fn causal_mask(t: usize, dev: &Device) -> Result<Tensor> {
 	Tensor::from_vec(mask, (t, t), dev)
 }
 
-fn get_batch(data: &[u32], b: usize, t: usize, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
+fn get_batch(data: &[u16], b: usize, t: usize, rng: &mut StdRng, dev: &Device) -> Result<(Tensor, Tensor)> {
 	let mut xs = Vec::with_capacity(b * t);
 	let mut ys = Vec::with_capacity(b * t);
 	for _ in 0..b {
 		let i = rng.random_range(0..data.len() - t - 1);
-		xs.extend_from_slice(&data[i..i + t]);
+		xs.extend(data[i..i + t].iter().map(|&id| id as u32));
 		// 全位置で同時に「次の 1 トークン」を予測させるため、入力を 1 つずらしたものを正解にする。
 		// causal mask があるので、長さ T の 1 本から「1 文字目まで → 2 文字目」…「T 文字目まで → T+1 文字目」の T 問を 1 回で解かせられる
-		ys.extend_from_slice(&data[i + 1..i + t + 1]);
+		ys.extend(data[i + 1..i + t + 1].iter().map(|&id| id as u32));
 	}
 	Ok((Tensor::from_vec(xs, (b, t), dev)?, Tensor::from_vec(ys, (b, t), dev)?))
 }
@@ -401,7 +434,7 @@ fn lr_at(cfg: &TrainConfig, step: usize) -> f64 {
 
 // 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
 // model には計算グラフを作らない評価用モデル（main の eval_model）を渡す
-fn estimate_loss(model: &Gpt, data: &[u32], cfg: &TrainConfig, rng: &mut StdRng, dev: &Device) -> Result<f32> {
+fn estimate_loss(model: &Gpt, data: &[u16], cfg: &TrainConfig, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 	let mut total = 0.0;
 	for _ in 0..cfg.eval_iters {
 		let (x, y) = get_batch(data, cfg.batch_size, cfg.model.block_size, rng, dev)?;
@@ -522,6 +555,14 @@ struct TrainArgs {
 	#[arg(default_value = "input.txt")]
 	data: PathBuf,
 
+	/// 検証データのテキストファイル（省略時は学習データの末尾 1 割を検証に回す）
+	#[arg(long)]
+	val: Option<PathBuf>,
+
+	/// dropout 率（省略時は設定ごとの既定値）。データが十分大きく丸暗記が起きないなら 0 でよい
+	#[arg(long)]
+	dropout: Option<f32>,
+
 	/// CPU で数十秒で終わる小さい設定を使う
 	#[arg(long)]
 	tiny: bool,
@@ -591,6 +632,12 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	if let Some(steps) = args.steps {
 		cfg.max_steps = steps;
 	}
+	if let Some(p) = args.dropout {
+		if !(0.0..1.0).contains(&p) {
+			candle_core::bail!("--dropout は 0 以上 1 未満である必要がある: {p}");
+		}
+		cfg.dropout = p;
+	}
 	if args.viz_every == 0 {
 		candle_core::bail!("--viz-every は 1 以上である必要がある");
 	}
@@ -603,20 +650,36 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 		);
 	}
 
-	let path = &args.data;
-	let text =
-		std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
-	let tok = Tokenizer::from_text(&text);
-	let data = tok.encode(&text)?;
-	// 学習に使っていない部分で測らないと、丸暗記しただけでも loss が下がって見えてしまう
-	let n_train = data.len() * 9 / 10;
-	let (train, val) = data.split_at(n_train);
+	let read = |path: &Path| {
+		std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))
+	};
+	let text = read(&args.data)?;
+	let val_text = args.val.as_deref().map(read).transpose()?;
+	// 検証データにしか出てこない文字があると encode が失敗するので、語彙は両方から作る
+	let texts: Vec<&str> = std::iter::once(text.as_str()).chain(val_text.as_deref()).collect();
+	let tok = Tokenizer::from_texts(&texts);
+	let data = tok.encode_corpus(&text)?;
+	let val_data = val_text.as_deref().map(|t| tok.encode_corpus(t)).transpose()?;
+	// 数 GB のテキストを ID 列と二重に持たないよう、encode し終えたら手放す
+	drop(texts);
+	drop(text);
+	drop(val_text);
+	let (train, val) = match &val_data {
+		Some(v) => (data.as_slice(), v.as_slice()),
+		// 学習に使っていない部分で測らないと、丸暗記しただけでも loss が下がって見えてしまう
+		None => data.split_at(data.len() * 9 / 10),
+	};
 	// get_batch は block_size + 1 文字の窓を取るので、どちらの区間もそれより長くないと範囲が空になる
-	if val.len() <= cfg.model.block_size + 1 {
+	if train.len().min(val.len()) <= cfg.model.block_size + 1 {
 		candle_core::bail!(
-			"{}: 学習データが短すぎる（{} 文字。検証用の 1 割が block_size + 1 = {} 文字を超える必要がある）",
-			path.display(),
-			data.len(),
+			"{}{}: 学習データか検証データが短すぎる（学習 {} 文字 / 検証 {} 文字。どちらも block_size + 1 = {} 文字を超える必要がある）",
+			args.data.display(),
+			args.val
+				.as_ref()
+				.map(|p| format!(" / {}", p.display()))
+				.unwrap_or_default(),
+			train.len(),
+			val.len(),
 			cfg.model.block_size + 1
 		);
 	}
@@ -642,9 +705,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	)?;
 	let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
 	println!(
-		"device: {:?} / chars: {} / vocab: {} / params: {:.2}M",
+		"device: {:?} / chars: train {} + val {} / vocab: {} / params: {:.2}M",
 		dev,
-		data.len(),
+		train.len(),
+		val.len(),
 		tok.vocab_size(),
 		n_params as f64 / 1e6
 	);

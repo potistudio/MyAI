@@ -16,12 +16,12 @@ pub struct Viz<'a> {
 	tok: &'a Tokenizer,
 	block_size: usize,
 	// 行頭から始まる検証データの区間。毎回同じ区間を入力し、変化の原因を重みの更新だけにする
-	sample: &'a [u32],
+	sample: Vec<u32>,
 	log: Vec<String>,
 }
 
 impl<'a> Viz<'a> {
-	pub fn new(tok: &'a Tokenizer, block_size: usize, val: &'a [u32]) -> Result<Self> {
+	pub fn new(tok: &'a Tokenizer, block_size: usize, val: &[u16]) -> Result<Self> {
 		// Windows の従来コンソールは既定でエスケープシーケンスを解釈しないので、仮想端末処理を有効にする。
 		// 有効にできない端末でも学習自体は続けられるので、結果は確認しない
 		let _ = anstyle_query::windows::enable_ansi_colors();
@@ -30,7 +30,7 @@ impl<'a> Viz<'a> {
 		let start = tok
 			.stoi
 			.get(&'\n')
-			.and_then(|nl| val.iter().position(|id| id == nl))
+			.and_then(|&nl| val.iter().position(|&id| id as u32 == nl))
 			.map(|i| i + 1)
 			.filter(|&i| val.len() - i > block_size + 1)
 			.unwrap_or(0);
@@ -38,7 +38,11 @@ impl<'a> Viz<'a> {
 		Ok(Self {
 			tok,
 			block_size,
-			sample: &val[start..],
+			// 各描画が読むのは先頭から最大 block_size + 256 文字なので、検証データ全体ではなく余裕を持たせた分だけ u32 に写す
+			sample: val[start..val.len().min(start + 2 * block_size + 512)]
+				.iter()
+				.map(|&id| id as u32)
+				.collect(),
 			log: Vec::new(),
 		})
 	}
