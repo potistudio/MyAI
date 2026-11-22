@@ -20,7 +20,7 @@ use candle_core::backprop::GradStore;
 use candle_core::{D, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{
 	AdamW, Embedding, Init, Linear, Module, Optimizer, ParamsAdamW, VarBuilder, VarMap, embedding, linear,
-	linear_no_bias, loss,
+	linear_no_bias, loss, ops,
 };
 use rand::distr::{Distribution, weighted::WeightedIndex};
 use rand::rngs::StdRng;
@@ -65,8 +65,14 @@ struct TrainConfig {
 	batch_size: usize,
 	// 1 回の forward / backward に載せる本数。batch_size を割り切れる値にする
 	micro_batch: usize,
+	// lr はウォームアップ後の最大値。cosine で max_steps に向けて min_lr まで下げる
 	lr: f64,
+	min_lr: f64,
+	// 学習初期は AdamW の勾配統計が溜まっておらず更新幅が不安定なので、この step 数をかけて 0 から lr まで線形に上げる
+	warmup_steps: usize,
 	max_steps: usize,
+	// 学習時のみ有効にする。評価と生成では 0 にする
+	dropout: f32,
 	eval_interval: usize,
 	eval_iters: usize,
 }
@@ -86,7 +92,11 @@ impl TrainConfig {
 			// 16 本ずつ 4 回に分けて勾配を足し合わせれば、更新 1 回あたりの勾配は 64 本のときと同じになる
 			micro_batch: 16,
 			lr: 1e-3,
+			min_lr: 1e-4,
+			warmup_steps: 100,
 			max_steps: 5000,
+			// dropout 0 では学習データ約 100 万文字に対して 10M パラメータが丸暗記に回り、val loss が step 1500 前後から上がる
+			dropout: 0.2,
 			eval_interval: 250,
 			eval_iters: 50,
 		}
@@ -105,7 +115,11 @@ impl TrainConfig {
 			// 勾配累積の配線も tiny で確かめられるよう、1 step を 4 回の backward に分ける
 			micro_batch: 4,
 			lr: 3e-3,
+			min_lr: 3e-4,
+			warmup_steps: 20,
 			max_steps: 1000,
+			// dropout の逆伝播経路も tiny で通すため 0 にしない
+			dropout: 0.1,
 			eval_interval: 200,
 			eval_iters: 10,
 		}
@@ -190,6 +204,11 @@ fn softmax(x: &Tensor) -> Result<Tensor> {
 	x.broadcast_div(&x.sum_keepdim(D::Minus1)?)
 }
 
+// ops::dropout は p = 0 でも乱数テンソルとマスクを確保するので、評価・生成用モデルではその確保を省く
+fn dropout(x: &Tensor, p: f32) -> Result<Tensor> {
+	if p > 0.0 { ops::dropout(x, p) } else { Ok(x.clone()) }
+}
+
 // 各位置に「過去のどの位置から情報を持ってくるか」を入力に応じて自分で決めさせたい。
 // そのために各位置のベクトルから 3 種類のベクトルを作る:
 //   Q（Query）: 自分が探している情報
@@ -201,10 +220,11 @@ struct CausalSelfAttention {
 	c_attn: Linear,
 	c_proj: Linear,
 	n_head: usize,
+	dropout: f32,
 }
 
 impl CausalSelfAttention {
-	fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, dropout: f32, vb: VarBuilder) -> Result<Self> {
 		// Q, K, V を 3 回の matmul に分けるより 1 回にまとめた方が GPU を効率よく使える
 		let c_attn = linear(cfg.n_embd, 3 * cfg.n_embd, vb.pp("c_attn"))?;
 		let c_proj = linear(cfg.n_embd, cfg.n_embd, vb.pp("c_proj"))?;
@@ -212,6 +232,7 @@ impl CausalSelfAttention {
 			c_attn,
 			c_proj,
 			n_head: cfg.n_head,
+			dropout,
 		})
 	}
 
@@ -234,11 +255,12 @@ impl CausalSelfAttention {
 		let att = (q.matmul(&k.t()?.contiguous()?)? / (hd as f64).sqrt())?;
 		// 未来の位置のスコアを -inf にしておけば、softmax 後の重みがちょうど 0 になる
 		let att = att.broadcast_add(mask)?;
-		let att = softmax(&att)?;
+		// 参照先の一部を毎 step ランダムに切り、特定の位置の組み合わせだけに依存する重みを作らせない
+		let att = dropout(&softmax(&att)?, self.dropout)?;
 
 		// 各ヘッドが集めた情報を連結し、c_proj で混ぜてから残差に戻す
 		let y = att.matmul(&v)?.transpose(1, 2)?.reshape((b, t, c))?;
-		self.c_proj.forward(&y)
+		dropout(&self.c_proj.forward(&y)?, self.dropout)
 	}
 }
 
@@ -247,18 +269,20 @@ impl CausalSelfAttention {
 struct Mlp {
 	fc: Linear,
 	proj: Linear,
+	dropout: f32,
 }
 
 impl Mlp {
-	fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, dropout: f32, vb: VarBuilder) -> Result<Self> {
 		Ok(Self {
 			fc: linear(cfg.n_embd, 4 * cfg.n_embd, vb.pp("fc"))?,
 			proj: linear(4 * cfg.n_embd, cfg.n_embd, vb.pp("proj"))?,
+			dropout,
 		})
 	}
 
 	fn forward(&self, x: &Tensor) -> Result<Tensor> {
-		self.proj.forward(&self.fc.forward(x)?.gelu()?)
+		dropout(&self.proj.forward(&self.fc.forward(x)?.gelu()?)?, self.dropout)
 	}
 }
 
@@ -270,12 +294,12 @@ struct Block {
 }
 
 impl Block {
-	fn new(cfg: &ModelConfig, vb: VarBuilder) -> Result<Self> {
+	fn new(cfg: &ModelConfig, dropout: f32, vb: VarBuilder) -> Result<Self> {
 		Ok(Self {
 			ln1: LayerNorm::new(cfg.n_embd, vb.pp("ln1"))?,
-			attn: CausalSelfAttention::new(cfg, vb.pp("attn"))?,
+			attn: CausalSelfAttention::new(cfg, dropout, vb.pp("attn"))?,
 			ln2: LayerNorm::new(cfg.n_embd, vb.pp("ln2"))?,
-			mlp: Mlp::new(cfg, vb.pp("mlp"))?,
+			mlp: Mlp::new(cfg, dropout, vb.pp("mlp"))?,
 		})
 	}
 
@@ -294,12 +318,14 @@ struct Gpt {
 	blocks: Vec<Block>,
 	ln_f: LayerNorm,
 	lm_head: Linear,
+	dropout: f32,
 }
 
 impl Gpt {
-	fn new(cfg: &ModelConfig, vocab_size: usize, vb: VarBuilder) -> Result<Self> {
+	// dropout はモデルファイルに保存しない。学習中の更新用モデルだけが 0 より大きい値を受け取る
+	fn new(cfg: &ModelConfig, vocab_size: usize, dropout: f32, vb: VarBuilder) -> Result<Self> {
 		let blocks = (0..cfg.n_layer)
-			.map(|i| Block::new(cfg, vb.pp(format!("h.{i}"))))
+			.map(|i| Block::new(cfg, dropout, vb.pp(format!("h.{i}"))))
 			.collect::<Result<_>>()?;
 		Ok(Self {
 			// ID のままだと「3 番と 4 番は近い」という意味のない大小関係がつくので、ID ごとに学習可能なベクトルを割り当てる。
@@ -311,6 +337,7 @@ impl Gpt {
 			blocks,
 			ln_f: LayerNorm::new(cfg.n_embd, vb.pp("ln_f"))?,
 			lm_head: linear_no_bias(cfg.n_embd, vocab_size, vb.pp("lm_head"))?,
+			dropout,
 		})
 	}
 
@@ -318,7 +345,8 @@ impl Gpt {
 		let (_b, t) = idx.dims2()?;
 		let dev = idx.device();
 		let pos = Tensor::arange(0u32, t as u32, dev)?;
-		let mut x = self.wte.forward(idx)?.broadcast_add(&self.wpe.forward(&pos)?)?;
+		let x = self.wte.forward(idx)?.broadcast_add(&self.wpe.forward(&pos)?)?;
+		let mut x = dropout(&x, self.dropout)?;
 		let mask = causal_mask(t, dev)?;
 		for block in &self.blocks {
 			x = block.forward(&x, &mask)?;
@@ -355,6 +383,17 @@ fn compute_loss(model: &Gpt, x: &Tensor, y: &Tensor) -> Result<Tensor> {
 	let logits = model.forward(x)?;
 	let (b, t, v) = logits.dims3()?;
 	loss::cross_entropy(&logits.reshape((b * t, v))?, &y.reshape(b * t)?)
+}
+
+// 後半も lr が大きいままだと学習データへの過適合が進むので、ウォームアップ後は cosine で min_lr まで下げる
+fn lr_at(cfg: &TrainConfig, step: usize) -> f64 {
+	if step < cfg.warmup_steps {
+		return cfg.lr * (step + 1) as f64 / cfg.warmup_steps as f64;
+	}
+	let decay_steps = cfg.max_steps.saturating_sub(cfg.warmup_steps).max(1);
+	let progress = ((step - cfg.warmup_steps) as f64 / decay_steps as f64).min(1.0);
+	let coeff = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
+	cfg.min_lr + coeff * (cfg.lr - cfg.min_lr)
 }
 
 // 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
@@ -449,6 +488,7 @@ fn load_model(path: &Path, dev: &Device) -> Result<(Gpt, ModelConfig, Tokenizer)
 	let model = Gpt::new(
 		&cfg,
 		tok.vocab_size(),
+		0.0,
 		VarBuilder::from_tensors(tensors, DType::F32, dev),
 	)?;
 	Ok((model, cfg, tok))
@@ -569,7 +609,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 
 	let varmap = VarMap::new();
 	let vb = VarBuilder::from_varmap(&varmap, DType::F32, dev);
-	let model = Gpt::new(&cfg.model, tok.vocab_size(), vb)?;
+	let model = Gpt::new(&cfg.model, tok.vocab_size(), cfg.dropout, vb)?;
 	// Var から計算した結果は逆伝播用に入力への参照を持ち続けるので、forward だけでも中間テンソルが最後まで解放されない。
 	// 評価と生成は逆伝播しないので、detach した重みで同じ構造のモデルをもう 1 つ組んでそちらを使う。
 	// detach は Var と同じストレージを指し、AdamW の更新（Var::set）はストレージを書き換えるので、毎 step の重みがそのまま見える
@@ -583,6 +623,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let eval_model = Gpt::new(
 		&cfg.model,
 		tok.vocab_size(),
+		0.0,
 		VarBuilder::from_tensors(detached, DType::F32, dev),
 	)?;
 	let n_params: usize = varmap.all_vars().iter().map(|v| v.elem_count()).sum();
@@ -597,7 +638,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let mut opt = AdamW::new(
 		varmap.all_vars(),
 		ParamsAdamW {
-			lr: cfg.lr,
+			lr: lr_at(&cfg, 0),
+			// 1 step あたりのトークン数が少なく勾配のばらつきが大きいので、nanoGPT の Shakespeare 設定に合わせて
+			// 2 次モーメントの平均を既定の 0.999 より短い期間で取る
+			beta2: 0.99,
 			..Default::default()
 		},
 	)?;
@@ -605,14 +649,23 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let vars: Vec<Tensor> = varmap.all_vars().iter().map(|v| v.as_tensor().clone()).collect();
 	let mut rng = StdRng::seed_from_u64(args.seed);
 	let t0 = Instant::now();
+	// 最終 step の重みは過学習で val loss 最小時より悪化しうるので、val loss が最小値を更新するたびに保存する
+	let mut best_val = f32::INFINITY;
 
 	for step in 0..=cfg.max_steps {
 		if step % cfg.eval_interval == 0 || step == cfg.max_steps {
 			let tr = estimate_loss(&eval_model, train, &cfg, &mut rng, dev)?;
 			let va = estimate_loss(&eval_model, val, &cfg, &mut rng, dev)?;
+			let improved = va < best_val;
+			if improved {
+				best_val = va;
+				save_model(&args.out, &varmap, &cfg.model, &tok)?;
+			}
 			println!(
-				"step {step:5} | train {tr:.4} | val {va:.4} | {:.1}s",
-				t0.elapsed().as_secs_f32()
+				"step {step:5} | train {tr:.4} | val {va:.4} | lr {:.2e} | {:.1}s{}",
+				opt.learning_rate(),
+				t0.elapsed().as_secs_f32(),
+				if improved { " | saved" } else { "" }
 			);
 		}
 		if step == cfg.max_steps {
@@ -639,15 +692,17 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			}
 		}
 		// 勾配そのままだと重みごとにスケールがばらばらなので、AdamW で過去の勾配の平均と大きさを使って歩幅を揃えて更新する
+		opt.set_learning_rate(lr_at(&cfg, step));
 		opt.step(&grads)?;
 	}
 
-	save_model(&args.out, &varmap, &cfg.model, &tok)?;
-	println!("saved: {}", args.out.display());
+	println!("best val {best_val:.4}: {}", args.out.display());
 
 	if args.sample_len > 0 {
+		// eval_model は最終 step の重みを参照するので、保存済みファイルと同じ重みで生成するために読み直す
+		let (best_model, _, _) = load_model(&args.out, dev)?;
 		let out = generate(
-			&eval_model,
+			&best_model,
 			&[0],
 			args.sample_len,
 			0.8,
