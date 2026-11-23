@@ -418,8 +418,8 @@ pub struct CorpusEncoder<'a> {
 
 impl<'a> CorpusEncoder<'a> {
 	// 出現が 1 回だけの塊が多いコーパスでもメモリが増え続けないよう、この件数を超えたらキャッシュを空にする。
-	// キャッシュに入れる塊は LONG_PIECE バイト以下で、1 件は英単語程度の塊で約 100 バイト、64 バイトの塊で約 250 バイト。
-	// スレッドごとに持つので、1 スレッドあたり典型的に約 25MB、最大で約 64MB になる
+	// キャッシュに入れる塊は LONG_PIECE バイト以下で、1 件はアロケーターの管理領域を含めて英単語程度の塊で約 130 バイト、
+	// 64 バイトの塊で約 290 バイト。スレッドごとに持つので、1 スレッドあたり典型的に約 30MB、最大で約 75MB になる
 	const CACHE_LIMIT: usize = 1 << 18;
 
 	pub fn new(tok: &'a Tokenizer) -> Self {
@@ -812,15 +812,21 @@ mod tests {
 
 	#[test]
 	fn corpus_encoder_handles_uncached_long_pieces() {
-		// LONG_PIECE を超える塊はキャッシュに入らないので、同じ長い塊が 2 回目に現れても encode と同じ結果になることを確かめる
+		// LONG_PIECE を超える塊はキャッシュに入れずに出力だけする。改行で区切って同じ長い塊を 2 回置き、
+		// 2 回とも出力に残ることと、キャッシュには短い塊だけが入ることを確かめる
 		let long = "thethethe".repeat(12);
-		let doc = format!("{long} and {long}.");
+		let doc = format!("{long}\n{long}.");
 		let tok = trained(&doc, 400);
-		let ids = tok.encode_documents(&[doc.as_str()]);
 		let mut expected = vec![tok.special(Special::EndOfText)];
 		expected.extend(tok.encode(&doc));
-		assert_eq!(ids.iter().map(|&id| id as u32).collect::<Vec<_>>(), expected);
+		let mut enc = CorpusEncoder::new(&tok);
+		let mut out = Vec::new();
+		enc.push_document(&doc, &mut out);
+		assert_eq!(out.iter().map(|&id| id as u32).collect::<Vec<_>>(), expected);
 		assert_eq!(tok.decode(&expected[1..]), doc);
+		// キャッシュに入るのは "\n" と "." だけ
+		assert!(enc.cache.keys().all(|k| k.len() <= LONG_PIECE));
+		assert_eq!(enc.cache.len(), 2);
 	}
 
 	#[test]
