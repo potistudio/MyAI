@@ -12,3 +12,7 @@ refs/
 
 # Corpora (scripts/download-tinystories.bat)
 /data/
+
+# Default outputs written to the repository root
+/*.safetensors
+/tokenizer.json

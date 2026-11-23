@@ -1,16 +1,20 @@
-//! 文字単位の最小 GPT。
+//! バイトレベル BPE のトークンを単位にした最小 GPT。
 //!
-//! モデルにやらせたいことは「ここまでの文字列を見て、次の 1 文字の確率分布を出す」の 1 つだけ。
-//! 文章を生成したいときはその分布から 1 文字引いて末尾に足し、また次を予測させる（`generate`）。
-//! 学習では、正解の次の文字に高い確率を出せるよう重みを少しずつ動かす（`main` の学習ループ）。
+//! モデルにやらせたいことは「ここまでのトークン列を見て、次の 1 トークンの確率分布を出す」の 1 つだけ。
+//! 文章を生成したいときはその分布から 1 トークン引いて末尾に足し、また次を予測させる（`generate`）。
+//! 学習では、正解の次のトークンに高い確率を出せるよう重みを少しずつ動かす（`fit` の学習ループ）。
 //!
 //! 処理の流れ:
 //!   文字列 → Tokenizer で ID 列 → wte + wpe でベクトル列
 //!   → Block × N（Attention で過去から情報を集め、MLP で加工し、残差に書き足す）
-//!   → ln_f → lm_head で語彙ごとのスコア（logits）→ softmax で次の文字の確率
+//!   → ln_f → lm_head で語彙ごとのスコア（logits）→ softmax で次のトークンの確率
+//!
+//! トークナイザーはモデルより先に作り、モデルファイルにも同じものを埋め込む:
+//!   tokenizer train  コーパスからマージを学習し、tokenizer.json に保存する
+//!   tokenizer encode コーパスを ID 列の .bin に変換する。train は .bin もテキストも読める
 //!
 //! 対話モデルは 2 段階で作る。重みは最後まで 1 組で、汎用の文章力と対話の振る舞いを同じ重みに持たせる:
-//!   train    文章コーパスで次の文字の予測を学習する（事前学習）
+//!   train    文章コーパスで次のトークンの予測を学習する（事前学習）
 //!   finetune train の重みから始め、会話データの AI の返事の部分だけを loss に数えて追加学習する（SFT）
 //!   chat     finetune の重みで、入力した発言への返事を生成する
 
@@ -23,7 +27,10 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 
 mod chat;
+mod corpus;
+mod tokenizer;
 mod viz;
+use tokenizer::{Special, StreamDecoder, Tokenizer};
 use viz::Viz;
 
 use candle_core::backprop::GradStore;
@@ -94,7 +101,8 @@ struct TrainConfig {
 }
 
 impl TrainConfig {
-	// nanoGPT の文字単位 Shakespeare 設定と同規模にして、既知の loss（val 1.47 前後）と突き合わせられるようにする
+	// モデルの形は nanoGPT の文字単位 Shakespeare 設定と同じ。トークンの単位が違うので loss の値は nanoGPT と比べられず、
+	// 文字単位のモデルとの比較には評価ログの bpb を使う
 	fn gpu() -> Self {
 		Self {
 			model: ModelConfig {
@@ -111,7 +119,7 @@ impl TrainConfig {
 			min_lr: 1e-4,
 			warmup_steps: 100,
 			max_steps: 5000,
-			// dropout 0 では学習データ約 100 万文字に対して 10M パラメータが丸暗記に回り、val loss が step 1500 前後から上がる
+			// input.txt（約 1.1MB）程度の学習データでは、dropout 0 だと 10M パラメータが丸暗記に回り、val loss が途中から上がる
 			dropout: 0.2,
 			// nanoGPT の既定値。candle の AdamW 既定は 0.01
 			weight_decay: 0.1,
@@ -147,8 +155,9 @@ impl TrainConfig {
 	}
 
 	// モデルの形は土台のモデルファイルから受け取る。
-	// 会話データは約 160 万文字で、1 step（64 本 × 256 文字）の約 100 倍しかない。max_steps 1000 で約 10 周するので、
-	// 事前学習より lr を約 1/3 に下げ、step 数も 1/5 に減らす。lr が大きいと事前学習で得た重みが大きく動き、文章力が落ちる
+	// 会話データ（scripts/download-chat.bat）は本文が約 160 万文字で、1 トークン約 4 バイトとして約 40 万トークン。
+	// 1 step（64 本 × 256 トークン）の約 25 倍しかないので、max_steps 250 で約 10 周する。
+	// 事前学習より lr を約 1/3 に下げる。lr が大きいと事前学習で得た重みが大きく動き、文章力が落ちる
 	fn finetune(model: ModelConfig) -> Self {
 		Self {
 			model,
@@ -156,12 +165,12 @@ impl TrainConfig {
 			micro_batch: 16,
 			lr: 3e-4,
 			min_lr: 3e-5,
-			warmup_steps: 50,
-			max_steps: 1000,
+			warmup_steps: 25,
+			max_steps: 250,
 			dropout: 0.1,
 			weight_decay: 0.1,
 			grad_clip: 1.0,
-			eval_interval: 50,
+			eval_interval: 25,
 			eval_iters: 20,
 		}
 	}
@@ -194,89 +203,6 @@ impl TrainConfig {
 		}
 		Ok(())
 	}
-}
-
-// ニューラルネットは数値しか扱えないので、文字を整数 ID に置き換える必要がある。
-// まず「トークン = 1 文字」から始めて、BPE を入れたときの差を後で比較できるようにする
-struct Tokenizer {
-	itos: Vec<char>,
-	stoi: HashMap<char, u32>,
-}
-
-impl Tokenizer {
-	fn from_texts(texts: &[&str]) -> Self {
-		Self::from_chars(distinct_chars(texts))
-	}
-
-	// 既存の ID を変えずに、texts に出てきて語彙に無い文字を末尾に足した語彙を作る。
-	// 既存の ID が変わらないので、学習済みの wte と lm_head の各行を同じ番号のまま新しい語彙でも使える
-	fn extended(&self, texts: &[&str]) -> Self {
-		let mut itos = self.itos.clone();
-		itos.extend(distinct_chars(texts).into_iter().filter(|c| !self.stoi.contains_key(c)));
-		Self::from_chars(itos)
-	}
-
-	// 学習時と同じ ID 割り当てを再現するため、保存しておいた itos の並びから組み直す
-	fn from_chars(itos: Vec<char>) -> Self {
-		let stoi = itos.iter().enumerate().map(|(i, &c)| (c, i as u32)).collect();
-		Self { itos, stoi }
-	}
-
-	fn vocab_size(&self) -> usize {
-		self.itos.len()
-	}
-
-	// プロンプトは学習データに無い文字を含みうるので、未知の文字はエラーにする
-	fn encode(&self, s: &str) -> Result<Vec<u32>> {
-		s.chars()
-			.map(|c| {
-				self.stoi
-					.get(&c)
-					.copied()
-					.ok_or_else(|| candle_core::Error::Msg(format!("語彙に無い文字: {c:?}")))
-			})
-			.collect()
-	}
-
-	// コーパス全体の ID 列は数十億要素になりうるので、u16 で持ってメモリを u32 の半分に抑える。
-	// 1 文字ごとの HashMap 引きも数十億回だと遅いので、文字コードで直接引ける表を使う
-	fn encode_corpus(&self, s: &str) -> Result<Vec<u16>> {
-		// u16::MAX は表の「語彙に無い」印に使うので、ID は u16::MAX 未満に収まる必要がある
-		if self.vocab_size() > u16::MAX as usize {
-			candle_core::bail!("語彙が {} 文字あり、u16 の ID に収まらない", self.vocab_size());
-		}
-		let mut lut = vec![u16::MAX; char::MAX as usize + 1];
-		for (i, &c) in self.itos.iter().enumerate() {
-			lut[c as usize] = i as u16;
-		}
-		// 文字数はバイト数以下なので、バイト数で確保すれば途中で再確保（一時的に 2 倍のメモリを使う）が起きない
-		let mut ids = Vec::with_capacity(s.len());
-		for c in s.chars() {
-			match lut[c as usize] {
-				u16::MAX => candle_core::bail!("語彙に無い文字: {c:?}"),
-				id => ids.push(id),
-			}
-		}
-		ids.shrink_to_fit();
-		Ok(ids)
-	}
-
-	fn decode(&self, ids: &[u32]) -> String {
-		ids.iter().map(|&i| self.itos[i as usize]).collect()
-	}
-}
-
-// ID の割り当てを実行ごとに変えないよう、文字コード順に並べて返す
-fn distinct_chars(texts: &[&str]) -> Vec<char> {
-	// 数 GB のコーパスでも 1 パスで速く終わるよう、集合ではなく文字コードで直接引けるフラグ表に出現を記録する
-	let mut seen = vec![false; char::MAX as usize + 1];
-	for c in texts.iter().flat_map(|t| t.chars()) {
-		seen[c as usize] = true;
-	}
-	(0..seen.len() as u32)
-		.filter(|&i| seen[i as usize])
-		.filter_map(char::from_u32)
-		.collect()
 }
 
 // candle_nn の LayerNorm と softmax_last_dim は高速化用の専用カーネルを使う代わりに逆伝播を持たず、
@@ -324,7 +250,7 @@ fn dropout(x: &Tensor, p: f32) -> Result<Tensor> {
 
 // candle の既定の初期値は linear が Kaiming（n_embd 384 で標準偏差約 0.07）、embedding が標準偏差 1 と大きい。
 // lm_head の入力は ln_f で分散 1 に揃うので、step 0 の logits の標準偏差は lm_head の重みでほぼ決まり、
-// Kaiming だと 0.07 * sqrt(384) ≒ 1.4 になって、loss が一様分布の ln(vocab) より高く出る（65 文字で 4.17 に対して約 5.1）。
+// Kaiming だと 0.07 * sqrt(384) ≒ 1.4 になって、loss が一様分布の ln(vocab) より高く出る（語彙 65 のとき 4.17 に対して約 5.1）。
 // embedding が大きいと、各層が残差に書き足す差分がそれに比べて小さくなり、序盤は層が効きにくい。
 // 序盤の step がこれらの修正に費やされないよう、nanoGPT と同じく平均 0・標準偏差 0.02 の正規分布から始め、bias は 0 にする
 const INIT_STD: f64 = 0.02;
@@ -361,7 +287,7 @@ fn embedding_init(n: usize, dim: usize, vb: VarBuilder) -> Result<Embedding> {
 //   K（Key）  : 自分が持っている情報の見出し
 //   V（Value）: 選ばれたときに実際に渡す中身
 // 位置 i の Q と各位置の K の内積を関連度スコアにし、softmax で重みに変えて V の重み付き平均を取る。
-// どの位置を見るべきか（直前の文字、行頭、対応する引用符など）は学習で獲得させる
+// どの位置を見るべきか（直前のトークン、行頭、対応する引用符など）は学習で獲得させる
 struct CausalSelfAttention {
 	c_attn: Linear,
 	c_proj: Linear,
@@ -386,7 +312,7 @@ impl CausalSelfAttention {
 		let (b, t, c) = x.dims3()?;
 		let hd = c / self.n_head;
 		let qkv = self.c_attn.forward(x)?;
-		// 1 種類の見方だけだと「直前の文字」と「行頭」を同時に参照できないので、
+		// 1 種類の見方だけだと「直前のトークン」と「行頭」を同時に参照できないので、
 		// n_embd 次元を n_head 個に分けて別々の観点で attention させる（multi-head）。
 		// ヘッドごとに独立して計算したいので (B, H, T, hd) に並べ替える
 		let split = |i: usize| {
@@ -476,7 +402,7 @@ impl Gpt {
 		Ok(Self {
 			// ID のままだと「3 番と 4 番は近い」という意味のない大小関係がつくので、ID ごとに学習可能なベクトルを割り当てる
 			wte: embedding_init(vocab_size, cfg.n_embd, vb.pp("wte"))?,
-			// attention は入力を順序のない集合として扱うので、「何文字目か」を位置ごとのベクトルとして足して教える。
+			// attention は入力を順序のない集合として扱うので、「何トークン目か」を位置ごとのベクトルとして足して教える。
 			// RoPE と比較するための基準として、最初は GPT-2 と同じ学習型の位置埋め込みにする
 			wpe: embedding_init(cfg.block_size, cfg.n_embd, vb.pp("wpe"))?,
 			blocks,
@@ -510,7 +436,7 @@ fn causal_mask(t: usize, dev: &Device) -> Result<Tensor> {
 }
 
 // 学習と評価で窓を切り出す元の ID 列。
-// mask が None なら全文字を正解として loss に数え（事前学習）、Some なら true の文字だけを数える（会話データの AI の返事）
+// mask が None なら全トークンを正解として loss に数え（事前学習）、Some なら true のトークンだけを数える（会話データの AI の返事）
 #[derive(Clone, Copy)]
 struct Corpus<'a> {
 	ids: &'a [u16],
@@ -560,9 +486,9 @@ fn get_batch(sources: &[(Corpus, f64)], b: usize, t: usize, rng: &mut StdRng, de
 		let i = rng.random_range(0..data.len() - t - 1);
 		xs.extend(data[i..i + t].iter().map(|&id| id as u32));
 		// 全位置で同時に「次の 1 トークン」を予測させるため、入力を 1 つずらしたものを正解にする。
-		// causal mask があるので、長さ T の 1 本から「1 文字目まで → 2 文字目」…「T 文字目まで → T+1 文字目」の T 問を 1 回で解かせられる
+		// causal mask があるので、長さ T の 1 本から「1 番目まで → 2 番目」…「T 番目まで → T+1 番目」の T 問を 1 回で解かせられる
 		ys.extend(data[i + 1..i + t + 1].iter().map(|&id| id as u32));
-		// mask は正解側の文字に対応させる。入力の文字ではなく、予測する文字が AI の返事かどうかで数えるかを決める
+		// mask は正解側のトークンに対応させる。入力のトークンではなく、予測するトークンが AI の返事かどうかで数えるかを決める
 		match src.mask {
 			Some(m) => ws.extend(m[i + 1..i + t + 1].iter().map(|&c| if c { 1.0f32 } else { 0.0 })),
 			None => ws.extend(std::iter::repeat_n(1.0f32, t)),
@@ -577,10 +503,10 @@ fn get_batch(sources: &[(Corpus, f64)], b: usize, t: usize, rng: &mut StdRng, de
 	})
 }
 
-// 「正解の文字につけた確率の -log」（cross entropy）を最小化したい。正解に確率 1 を出せば 0 になる。
-// 全文字を当てずっぽうにすると ln(vocab) で、65 文字なら 4.17。loss 2.0 は e^2 ≒ 7 択まで絞れている状態。
+// 「正解のトークンにつけた確率の -log」（cross entropy）を最小化したい。正解に確率 1 を出せば 0 になる。
+// 全トークンを当てずっぽうにすると ln(vocab) で、語彙 32768 なら 10.4。loss 2.0 は e^2 ≒ 7 択まで絞れている状態。
 // 返り値は weight を掛けた合計で、平均にはしない。勾配累積では 1 step 分の n_targets の合計で割り、
-// micro batch ごとに数える文字数が違っても、1 step 内の全対象文字の平均 loss の勾配にする
+// micro batch ごとに数えるトークン数が違っても、1 step 内の全対象トークンの平均 loss の勾配にする
 fn loss_sum(model: &Gpt, batch: &Batch) -> Result<Tensor> {
 	let logits = model.forward(&batch.x)?;
 	let (b, t, v) = logits.dims3()?;
@@ -668,7 +594,7 @@ fn clip_grad_norm(grads: &mut GradStore, vars: &[Tensor], max_norm: f64) -> Resu
 }
 
 // 1 バッチの loss はノイズが大きく改良の効果と見分けにくいので、複数バッチの平均で比べる。
-// mask 付きのデータではバッチごとに数える文字数が違うので、バッチの平均の平均ではなく、全対象文字の平均にする。
+// mask 付きのデータではバッチごとに数えるトークン数が違うので、バッチの平均の平均ではなく、全対象トークンの平均にする。
 // model には計算グラフを作らない評価用モデル（fit の eval_model）を渡す
 fn estimate_loss(model: &Gpt, data: Corpus, cfg: &TrainConfig, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 	let (mut sum, mut n) = (0.0f64, 0.0f64);
@@ -679,13 +605,13 @@ fn estimate_loss(model: &Gpt, data: Corpus, cfg: &TrainConfig, rng: &mut StdRng,
 	}
 	// 0 件を loss 0 として返すと、fit がそれを最小値として保存し、以後の重みが保存されなくなる
 	if n == 0.0 {
-		candle_core::bail!("評価に使ったバッチに、loss に数える文字（AI の発言）が 1 文字も無い");
+		candle_core::bail!("評価に使ったバッチに、loss に数えるトークン（AI の発言）が 1 つも無い");
 	}
 	Ok((sum / n) as f32)
 }
 
-// on_token は 1 文字引くたびに呼ばれ、CLI はここで逐次表示する。
-// Break を返すとその文字を末尾に含めたまま生成を止める。chat は返事の終わりの印で止めるのに使う
+// on_token は 1 トークン引くたびに呼ばれ、CLI はここで逐次表示する。
+// Break を返すとそのトークンを末尾に含めたまま生成を止める。chat は発言の終わりの特殊トークンで止めるのに使う
 #[allow(clippy::too_many_arguments)]
 fn generate(
 	model: &Gpt,
@@ -699,15 +625,15 @@ fn generate(
 ) -> Result<Vec<u32>> {
 	// 空の文脈では forward に長さ 0 の系列が渡り、最後の位置が存在しない
 	if start.is_empty() {
-		candle_core::bail!("生成の開始文字列が空");
+		candle_core::bail!("生成の開始トークン列が空");
 	}
 	let mut ids = start.to_vec();
 	for _ in 0..max_new {
 		// 仕組みを追いやすくするため毎回全文脈を計算し直す。KV キャッシュは推論側を作るときに入れる
 		let ctx = &ids[ids.len().saturating_sub(block_size)..];
 		let logits = model.forward(&Tensor::new(ctx, dev)?.unsqueeze(0)?)?;
-		// 次の文字の予測に使うのは最後の位置の出力だけ。
-		// temperature で割ってから softmax にかけ、1 未満なら確率の高い文字に寄せ、1 より大きければばらつかせる
+		// 次のトークンの予測に使うのは最後の位置の出力だけ。
+		// temperature で割ってから softmax にかけ、1 未満なら確率の高いトークンに寄せ、1 より大きければばらつかせる
 		let last = (logits.i((0, ctx.len() - 1))? / temperature)?;
 		let probs = softmax(&last)?.to_vec1::<f32>()?;
 		let dist = WeightedIndex::new(&probs).map_err(|e| candle_core::Error::Msg(e.to_string()))?;
@@ -721,9 +647,11 @@ fn generate(
 }
 
 // モデルファイルには重みと一緒に、生成時に Gpt と Tokenizer を組み直すための値を入れる。
-// 学習データのテキストが無くても generate できるよう、語彙もここに持たせる
+// tokenizer.json が無くても generate と chat ができるよう、トークナイザーの JSON をバイト列としてここに持たせる
 const META_CONFIG: &str = "meta.config";
-const META_VOCAB: &str = "meta.vocab";
+const META_TOKENIZER: &str = "meta.tokenizer";
+// 文字単位の版のモデルファイルだけが持つ値。読み込み時のエラーの文言を分けるのに使う
+const META_CHAR_VOCAB: &str = "meta.vocab";
 
 fn save_model(path: &Path, varmap: &VarMap, cfg: &ModelConfig, tok: &Tokenizer) -> Result<()> {
 	let mut tensors: HashMap<String, Tensor> = varmap
@@ -737,8 +665,10 @@ fn save_model(path: &Path, varmap: &VarMap, cfg: &ModelConfig, tok: &Tokenizer) 
 		META_CONFIG.to_string(),
 		Tensor::new(cfg.to_vec().as_slice(), &Device::Cpu)?,
 	);
-	let vocab: Vec<u32> = tok.itos.iter().map(|&c| c as u32).collect();
-	tensors.insert(META_VOCAB.to_string(), Tensor::new(vocab.as_slice(), &Device::Cpu)?);
+	tensors.insert(
+		META_TOKENIZER.to_string(),
+		Tensor::new(tok.to_json().as_bytes(), &Device::Cpu)?,
+	);
 	candle_core::safetensors::save(&tensors, path)
 }
 
@@ -758,29 +688,29 @@ fn load_model(path: &Path, dev: &Device) -> Result<(Gpt, ModelConfig, Tokenizer)
 fn load_tensors(path: &Path, dev: &Device) -> Result<(HashMap<String, Tensor>, ModelConfig, Tokenizer)> {
 	let mut tensors = candle_core::safetensors::load(path, dev)
 		.map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
-	let mut take_meta = |key: &str| -> Result<Vec<u32>> {
-		tensors
-			.remove(key)
-			.ok_or_else(|| {
-				candle_core::Error::Msg(format!(
-					"{}: {key} が無い。train サブコマンドで保存し直す必要がある",
-					path.display()
-				))
-			})?
-			.to_vec1::<u32>()
-	};
-	let cfg = ModelConfig::from_slice(&take_meta(META_CONFIG)?)?;
-	let itos = take_meta(META_VOCAB)?
-		.into_iter()
-		.map(|v| {
-			char::from_u32(v).ok_or_else(|| candle_core::Error::Msg(format!("{META_VOCAB} に不正な文字コード: {v}")))
+	if tensors.contains_key(META_CHAR_VOCAB) {
+		candle_core::bail!(
+			"{}: 文字単位のトークナイザーで学習したモデルで、今のバイトレベル BPE では読めない。train で学習し直す",
+			path.display()
+		);
+	}
+	let mut take_meta = |key: &str| -> Result<Tensor> {
+		tensors.remove(key).ok_or_else(|| {
+			candle_core::Error::Msg(format!(
+				"{}: {key} が無い。train サブコマンドで保存し直す必要がある",
+				path.display()
+			))
 		})
-		.collect::<Result<Vec<char>>>()?;
-	Ok((tensors, cfg, Tokenizer::from_chars(itos)))
+	};
+	let cfg = ModelConfig::from_slice(&take_meta(META_CONFIG)?.to_vec1::<u32>()?)?;
+	let json = String::from_utf8(take_meta(META_TOKENIZER)?.to_vec1::<u8>()?)
+		.map_err(|e| candle_core::Error::Msg(format!("{}: {META_TOKENIZER} が UTF-8 でない: {e}", path.display())))?;
+	let tok = Tokenizer::from_json(&json).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
+	Ok((tensors, cfg, tok))
 }
 
 #[derive(Parser)]
-#[command(version, about = "文字単位の最小 GPT を学習し、文章の生成と対話を行う")]
+#[command(version, about = "バイトレベル BPE の最小 GPT を学習し、文章の生成と対話を行う")]
 struct Cli {
 	/// CUDA が使える環境でも CPU で実行する
 	#[arg(long, global = true)]
@@ -792,7 +722,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-	/// テキストファイルでモデルを学習し、重みを保存する
+	/// トークナイザーの学習と、コーパスの ID 列への変換
+	#[command(subcommand)]
+	Tokenizer(TokenizerCommand),
+	/// テキストファイルか ID 列のファイルでモデルを学習し、重みを保存する
 	Train(TrainArgs),
 	/// train で保存したモデルを会話データで追加学習し、対話用の重みを保存する
 	Finetune(FinetuneArgs),
@@ -825,8 +758,8 @@ struct LoopArgs {
 	#[arg(long, default_value_t = 1337)]
 	seed: u64,
 
-	/// 学習後に生成するサンプルの文字数（0 で生成しない）
-	#[arg(long, default_value_t = 500)]
+	/// 学習後に生成するサンプルのトークン数（0 で生成しない）
+	#[arg(long, default_value_t = 200)]
 	sample_len: usize,
 
 	/// 予測の当たり具合で検証データを色分けする表示を止め、評価ログを 1 行ずつ流す（標準出力が端末でないときは指定しなくても止まる）
@@ -864,15 +797,61 @@ impl LoopArgs {
 	}
 }
 
+#[derive(Subcommand)]
+enum TokenizerCommand {
+	/// コーパスの先頭からマージを学習し、トークナイザーを JSON で保存する
+	Train(TokenizerTrainArgs),
+	/// コーパスを ID 列に変換し、train が読める .bin で保存する
+	Encode(TokenizerEncodeArgs),
+}
+
+#[derive(Args)]
+struct TokenizerTrainArgs {
+	/// 学習に使うコーパス。プレーンテキスト（`<|endoftext|>` で文書を区切る）か、1 行 1 文書の {"text": ...} の .jsonl
+	#[arg(required = true)]
+	inputs: Vec<PathBuf>,
+
+	/// 語彙数。バイト 256 個と特殊トークンの枠 16 個を含む。GPU の行列演算の効率のため 128 の倍数にする
+	#[arg(long, default_value_t = 32768)]
+	vocab: usize,
+
+	/// 学習に使う本文の量（MB）。inputs を先頭から順に読み、この量に達したら残りは読まない
+	#[arg(long, default_value_t = 1024)]
+	sample_mb: usize,
+
+	/// 保存先
+	#[arg(short, long, default_value = "tokenizer.json")]
+	out: PathBuf,
+}
+
+#[derive(Args)]
+struct TokenizerEncodeArgs {
+	/// 変換するコーパス（形式は tokenizer train と同じ）。指定した順に 1 本の ID 列へつなげる
+	#[arg(required = true)]
+	inputs: Vec<PathBuf>,
+
+	/// tokenizer train で保存したトークナイザー
+	#[arg(short, long, default_value = "tokenizer.json")]
+	tokenizer: PathBuf,
+
+	/// 保存先の .bin
+	#[arg(short, long)]
+	out: PathBuf,
+}
+
 #[derive(Args)]
 struct TrainArgs {
-	/// 学習データのテキストファイル
+	/// 学習データ。tokenizer encode で作った .bin か、tokenizer train と同じ形式のテキスト（読み込み時に encode する）
 	#[arg(default_value = "input.txt")]
 	data: PathBuf,
 
-	/// 検証データのテキストファイル（省略時は学習データの末尾 1 割を検証に回す）
+	/// 検証データ（形式は学習データと同じ。省略時は学習データの末尾 1 割を検証に回す）
 	#[arg(long)]
 	val: Option<PathBuf>,
+
+	/// tokenizer train で保存したトークナイザー。学習したモデルファイルにも埋め込む
+	#[arg(short, long, default_value = "tokenizer.json")]
+	tokenizer: PathBuf,
 
 	/// CPU で数十秒で終わる小さい設定を使う
 	#[arg(long)]
@@ -896,17 +875,16 @@ struct FinetuneArgs {
 	#[arg(long)]
 	val: Option<PathBuf>,
 
-	/// train で保存した土台のモデルファイル。モデルの形と語彙はこのファイルから引き継ぐ
+	/// train で保存した土台のモデルファイル。モデルの形とトークナイザーはこのファイルから引き継ぐ
 	#[arg(long)]
 	base: PathBuf,
 
-	/// 会話データに混ぜる文章コーパスのテキストファイル。事前学習で得た文章力が失われるのを抑える。
-	/// テキストと ID 列を同時に持つので、ファイルの大きさの約 3 倍のメモリを使う
+	/// 会話データに混ぜる文章コーパス（形式は train の学習データと同じ）。事前学習で得た文章力が失われるのを抑える
 	#[arg(long)]
 	mix: Option<PathBuf>,
 
 	/// 1 step の系列の本数のうち --mix の文章コーパスから取る割合。
-	/// 会話データは AI の発言の文字だけを loss に数えるので、loss に数える文字数に占める文章コーパスの割合はこの値より大きくなる
+	/// 会話データは AI の発言のトークンだけを loss に数えるので、loss に数えるトークン数に占める文章コーパスの割合はこの値より大きくなる
 	/// （会話データの約 7 割が AI の発言のとき、0.25 で約 3 割）
 	#[arg(long, default_value_t = 0.25, requires = "mix")]
 	mix_ratio: f64,
@@ -925,15 +903,15 @@ struct GenerateArgs {
 	#[arg(short, long, default_value = "model.safetensors")]
 	model: PathBuf,
 
-	/// 生成の書き出し（省略時は語彙の先頭の文字）
+	/// 生成の書き出し（省略時は新しい文書の先頭から生成する）
 	#[arg(short, long)]
 	prompt: Option<String>,
 
-	/// 生成する文字数
-	#[arg(short = 'n', long, default_value_t = 500)]
+	/// 生成するトークン数
+	#[arg(short = 'n', long, default_value_t = 200)]
 	len: usize,
 
-	/// 1 未満で確率の高い文字に寄り、1 より大きいとばらつく
+	/// 1 未満で確率の高いトークンに寄り、1 より大きいとばらつく
 	#[arg(short, long, default_value_t = 0.8)]
 	temperature: f64,
 
@@ -948,11 +926,11 @@ struct ChatArgs {
 	#[arg(short, long, default_value = "chat.safetensors")]
 	model: PathBuf,
 
-	/// 1 回の返事の最大文字数。返事の終わりの印が出なくてもこの文字数で打ち切る
-	#[arg(short = 'n', long, default_value_t = 300)]
+	/// 1 回の返事の最大トークン数。発言の終わりの特殊トークンが出なくてもこのトークン数で打ち切る
+	#[arg(short = 'n', long, default_value_t = 100)]
 	max_len: usize,
 
-	/// 1 未満で確率の高い文字に寄り、1 より大きいとばらつく
+	/// 1 未満で確率の高いトークンに寄り、1 より大きいとばらつく
 	#[arg(short, long, default_value_t = 0.8)]
 	temperature: f64,
 
@@ -969,19 +947,29 @@ fn select_device(cpu: bool) -> Result<Device> {
 	}
 }
 
-fn read_text(path: &Path) -> Result<String> {
-	std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))
-}
-
-// get_batch は block_size + 1 文字の窓を取るので、それより長くないと窓の開始位置の範囲が空になる
+// get_batch は block_size + 1 トークンの窓を取るので、それより長くないと窓の開始位置の範囲が空になる
 fn ensure_len(what: &str, len: usize, block_size: usize) -> Result<()> {
 	if len <= block_size + 1 {
 		candle_core::bail!(
-			"{what} が短すぎる（{len} 文字。block_size + 1 = {} 文字を超える必要がある）",
+			"{what} が短すぎる（{len} トークン。block_size + 1 = {} トークンを超える必要がある）",
 			block_size + 1
 		);
 	}
 	Ok(())
+}
+
+// loss に数えるトークンが平均で何バイトの本文に当たるか。特殊トークンは本文のバイトを持たないので 0 バイトとして数える。
+// loss（1 トークンあたりの nat）をこの値と ln 2 で割ると、1 バイトあたりの bit（bpb）になり、
+// 語彙の違うモデル（文字単位のモデルや語彙数の違う BPE）とも同じ尺度で比べられる
+fn bytes_per_token(tok: &Tokenizer, c: Corpus) -> f64 {
+	let (mut bytes, mut n) = (0usize, 0usize);
+	for (i, &id) in c.ids.iter().enumerate() {
+		if c.mask.is_none_or(|m| m[i]) {
+			bytes += tok.token_bytes(id as u32).len();
+			n += 1;
+		}
+	}
+	bytes as f64 / n.max(1) as f64
 }
 
 // train と finetune で共通の学習ループに渡す値。重みの初期値とデータの用意は呼び出し側が行う
@@ -996,8 +984,8 @@ struct Fit<'a> {
 	train_eval: Corpus<'a>,
 	val: Corpus<'a>,
 	out: &'a Path,
-	// 色分け表示を使う場合の (描き直し間隔, 表示を始める位置の直前の文字)
-	viz: Option<(usize, Option<char>)>,
+	// 色分け表示を使う場合の (描き直し間隔, 表示を始める位置の直前のトークン)
+	viz: Option<(usize, Option<u32>)>,
 	summary: String,
 }
 
@@ -1028,7 +1016,12 @@ fn fit(f: Fit, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 		VarBuilder::from_tensors(detached, DType::F32, dev),
 	)?;
 	let n_params: usize = f.varmap.all_vars().iter().map(|v| v.elem_count()).sum();
-	let summary = format!("{} / params: {:.2}M", f.summary, n_params as f64 / 1e6);
+	let val_bpt = bytes_per_token(f.tok, f.val);
+	let summary = format!(
+		"{} / val: {val_bpt:.2} bytes/token / params: {:.2}M",
+		f.summary,
+		n_params as f64 / 1e6
+	);
 	println!("{summary}");
 
 	let mut opt = ParamGroups::new(
@@ -1067,8 +1060,14 @@ fn fit(f: Fit, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 				best_val = va;
 				save_model(f.out, f.varmap, &cfg.model, f.tok)?;
 			}
+			// 検証データに本文のバイトが無い（全部が特殊トークン）場合は bpb を定義できない
+			let bpb = if val_bpt > 0.0 {
+				format!("{:.4}", va as f64 / std::f64::consts::LN_2 / val_bpt)
+			} else {
+				"-".to_string()
+			};
 			let line = format!(
-				"step {step:5} | train {tr:.4} | val {va:.4} | lr {:.2e} | gnorm {} | {:.1}s{}",
+				"step {step:5} | train {tr:.4} | val {va:.4} ({bpb} bpb) | lr {:.2e} | gnorm {} | {:.1}s{}",
 				opt.learning_rate(),
 				grad_norm.map_or_else(|| "-".to_string(), |n| format!("{n:.2}")),
 				t0.elapsed().as_secs_f32(),
@@ -1095,8 +1094,8 @@ fn fit(f: Fit, rng: &mut StdRng, dev: &Device) -> Result<f32> {
 			break;
 		}
 		// loss を下げるには各重みをどちらにどれだけ動かせばいいかを、逆伝播で全パラメータ分まとめて求める。
-		// micro_batch ずつ backward して勾配を足し合わせる。各 loss を 1 step 分の対象文字数で割っておけば、
-		// 合計は batch_size 本の全対象文字の平均 loss の勾配と同じになる。
+		// micro_batch ずつ backward して勾配を足し合わせる。各 loss を 1 step 分の対象トークン数で割っておけば、
+		// 合計は batch_size 本の全対象トークンの平均 loss の勾配と同じになる。
 		// loss（計算グラフ）は 1 回ごとに捨てるので、同時に VRAM に載る中間テンソルは micro_batch 本ぶんだけで済む
 		let grad_accum = cfg.batch_size / cfg.micro_batch;
 		let batches = (0..grad_accum)
@@ -1155,17 +1154,9 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	};
 	let use_viz = args.common.apply(&mut cfg)?;
 
-	let text = read_text(&args.data)?;
-	let val_text = args.val.as_deref().map(read_text).transpose()?;
-	// 検証データにしか出てこない文字があると encode が失敗するので、語彙は両方から作る
-	let texts: Vec<&str> = std::iter::once(text.as_str()).chain(val_text.as_deref()).collect();
-	let tok = Tokenizer::from_texts(&texts);
-	let data = tok.encode_corpus(&text)?;
-	let val_data = val_text.as_deref().map(|t| tok.encode_corpus(t)).transpose()?;
-	// 数 GB のテキストを ID 列と二重に持たないよう、encode し終えたら手放す
-	drop(texts);
-	drop(text);
-	drop(val_text);
+	let tok = Tokenizer::load(&args.tokenizer)?;
+	let data = corpus::load_tokens(&args.data, &tok)?;
+	let val_data = args.val.as_deref().map(|p| corpus::load_tokens(p, &tok)).transpose()?;
 	let (train, val) = match &val_data {
 		Some(v) => (data.as_slice(), v.as_slice()),
 		// 学習に使っていない部分で測らないと、丸暗記しただけでも loss が下がって見えてしまう
@@ -1185,12 +1176,13 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	let varmap = VarMap::new();
 	let mut rng = StdRng::seed_from_u64(args.common.seed);
 	let summary = format!(
-		"device: {:?} / chars: train {} + val {} / vocab: {}",
+		"device: {:?} / tokens: train {} + val {} / vocab: {}",
 		dev,
 		train.len(),
 		val.len(),
 		tok.vocab_size()
 	);
+	let eot = tok.special(Special::EndOfText);
 	fit(
 		Fit {
 			cfg: &cfg,
@@ -1200,7 +1192,7 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			train_eval: Corpus::plain(train),
 			val: Corpus::plain(val),
 			out: &args.out,
-			viz: use_viz.then_some((args.common.viz_every, Some('\n'))),
+			viz: use_viz.then_some((args.common.viz_every, Some(eot))),
 			summary,
 		},
 		&mut rng,
@@ -1210,9 +1202,10 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 	if args.common.sample_len > 0 {
 		// eval_model は最終 step の重みを参照するので、保存済みファイルと同じ重みで生成するために読み直す
 		let (best_model, _, _) = load_model(&args.out, dev)?;
+		// 学習データの各文書は文書の区切りの直後から始まるので、区切りから書き出すと文書の冒頭を生成する
 		let out = generate(
 			&best_model,
-			&[0],
+			&[eot],
 			args.common.sample_len,
 			0.8,
 			block,
@@ -1220,18 +1213,16 @@ fn train(args: TrainArgs, dev: &Device) -> Result<()> {
 			dev,
 			|_| Ok(ControlFlow::Continue(())),
 		)?;
-		println!("----\n{}", tok.decode(&out));
+		println!("----\n{}", tok.decode(&out[1..]));
 	}
 	Ok(())
 }
 
-// 土台のモデルの重みを varmap の Var に書き写す。
-// 語彙を足した分の wte と lm_head の行は、Gpt::new の初期値（平均 0・標準偏差 0.02 の正規分布）のまま残す
+// 土台のモデルの重みを varmap の Var に書き写す。トークナイザーも土台のものを使うので、重みの形はすべて一致する
 fn init_from_base(
 	varmap: &VarMap,
 	mut base: HashMap<String, Tensor>,
 	cfg: &ModelConfig,
-	base_vocab: usize,
 	vocab: usize,
 	dev: &Device,
 ) -> Result<()> {
@@ -1240,12 +1231,6 @@ fn init_from_base(
 		let src = base
 			.remove(name)
 			.ok_or_else(|| candle_core::Error::Msg(format!("土台のモデルに {name} が無い")))?;
-		// 行 i は ID i の文字に対応する。Tokenizer::extended は既存の ID を変えないので、末尾に新しい行を足すだけで対応が保たれる
-		let src = if (name == "wte.weight" || name == "lm_head.weight") && vocab > base_vocab {
-			Tensor::cat(&[&src, &var.as_tensor().narrow(0, base_vocab, vocab - base_vocab)?], 0)?
-		} else {
-			src
-		};
 		var.set(&src)
 			.map_err(|e| candle_core::Error::Msg(format!("{name}: {e}")))?;
 	}
@@ -1263,7 +1248,7 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 	if args.mix.is_some() && args.mix_ratio == 0.0 {
 		candle_core::bail!("--mix-ratio 0 では --mix のコーパスが一度も使われない。0 より大きい値を指定する");
 	}
-	let (base, model_cfg, base_tok) = load_tensors(&args.base, dev)?;
+	let (base, model_cfg, tok) = load_tensors(&args.base, dev)?;
 	let mut cfg = TrainConfig::finetune(model_cfg);
 	let use_viz = args.common.apply(&mut cfg)?;
 
@@ -1282,9 +1267,9 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 			convs.split_off(convs.len() - n)
 		}
 	};
-	let (text, mask) = chat::render(&convs);
-	let (val_text, val_mask) = chat::render(&val_convs);
-	// AI の発言が無いと loss に数える文字が 0 になり、学習も評価も成り立たない
+	let (data, mask) = chat::render(&tok, &convs);
+	let (val_data, val_mask) = chat::render(&tok, &val_convs);
+	// AI の発言が無いと loss に数えるトークンが 0 になり、学習も評価も成り立たない
 	let val_name = args
 		.val
 		.as_ref()
@@ -1297,19 +1282,7 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 	if args.mix.is_none() {
 		eprintln!("--mix を指定していないので、会話データだけで学習する。事前学習で得た文章力は失われていく");
 	}
-	let mix_text = args.mix.as_deref().map(read_text).transpose()?;
-	// 区切りの印と、土台の語彙に無い文字（会話データにだけ出てくる記号など）を語彙の末尾に足す
-	let markers: String = chat::MARKERS.iter().collect();
-	let texts: Vec<&str> = [markers.as_str(), text.as_str(), val_text.as_str()]
-		.into_iter()
-		.chain(mix_text.as_deref())
-		.collect();
-	let tok = base_tok.extended(&texts);
-	drop(texts);
-	let data = tok.encode_corpus(&text)?;
-	let val_data = tok.encode_corpus(&val_text)?;
-	let mix_data = mix_text.as_deref().map(|t| tok.encode_corpus(t)).transpose()?;
-	drop(mix_text);
+	let mix_data = args.mix.as_deref().map(|p| corpus::load_tokens(p, &tok)).transpose()?;
 
 	let block = cfg.model.block_size;
 	ensure_len(&format!("会話データ {}", args.data.display()), data.len(), block)?;
@@ -1319,7 +1292,7 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 	}
 
 	let varmap = VarMap::new();
-	init_from_base(&varmap, base, &cfg.model, base_tok.vocab_size(), tok.vocab_size(), dev)?;
+	init_from_base(&varmap, base, &cfg.model, tok.vocab_size(), dev)?;
 
 	let chat_train = Corpus {
 		ids: &data,
@@ -1335,10 +1308,9 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 	}
 	let mut rng = StdRng::seed_from_u64(args.common.seed);
 	let summary = format!(
-		"device: {:?} / base: {} / vocab: {} → {} / conversations: train {} + val {} / chars: train {} + val {}{}",
+		"device: {:?} / base: {} / vocab: {} / conversations: train {} + val {} / tokens: train {} + val {}{}",
 		dev,
 		args.base.display(),
-		base_tok.vocab_size(),
 		tok.vocab_size(),
 		convs.len(),
 		val_convs.len(),
@@ -1346,7 +1318,7 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 		val_data.len(),
 		mix_data
 			.as_ref()
-			.map(|m| format!(" / mix: {} chars × {}", m.len(), args.mix_ratio))
+			.map(|m| format!(" / mix: {} tokens × {}", m.len(), args.mix_ratio))
 			.unwrap_or_default()
 	);
 	fit(
@@ -1374,9 +1346,9 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 		&& let Some(m) = first_user
 	{
 		let (best_model, _, _) = load_model(&args.out, dev)?;
-		let ids = ChatIds::new(&tok, &args.out)?;
+		let ids = ChatIds::new(&tok);
 		let mut history = Vec::new();
-		ids.push_user(&tok, &mut history, &m.content)?;
+		ids.push_user(&tok, &mut history, &m.content);
 		let mut reply = Vec::new();
 		ids.reply(
 			&best_model,
@@ -1396,42 +1368,38 @@ fn finetune(args: FinetuneArgs, dev: &Device) -> Result<()> {
 	Ok(())
 }
 
-// 会話の区切りの印の ID。印は finetune で語彙に足すので、train だけのモデルには無い
+// 会話の区切りの特殊トークンの ID。特殊トークンの枠は語彙に最初からあるので、train だけのモデルでも ID は決まる
 struct ChatIds {
 	user: u32,
 	assistant: u32,
 	end: u32,
+	// 全特殊トークンの ID の範囲。返事の途中に出た特殊トークンは、種類によらず返事の終わりとして扱う
+	specials: std::ops::Range<u32>,
 }
 
 impl ChatIds {
-	fn new(tok: &Tokenizer, model_path: &Path) -> Result<Self> {
-		let [user, assistant, end] = chat::MARKERS.map(|c| tok.stoi.get(&c).copied());
-		let (Some(user), Some(assistant), Some(end)) = (user, assistant, end) else {
-			candle_core::bail!(
-				"{}: 会話の区切りの印が語彙に無い。finetune で追加学習したモデルを指定する",
-				model_path.display()
-			);
-		};
-		Ok(Self { user, assistant, end })
-	}
-
-	// User の発言を履歴に足し、続けて AI の発言の印を置いて返事を生成できる状態にする。
-	// 語彙に無い文字や区切りの印を含む発言はエラーにし、履歴は変えない
-	fn push_user(&self, tok: &Tokenizer, history: &mut Vec<u32>, text: &str) -> Result<()> {
-		if text.contains(chat::MARKERS) {
-			candle_core::bail!("会話の区切り用の文字（U+E000〜U+E002）は入力できない");
+	fn new(tok: &Tokenizer) -> Self {
+		Self {
+			user: tok.special(Special::User),
+			assistant: tok.special(Special::Assistant),
+			end: tok.special(Special::End),
+			specials: tok.special(Special::EndOfText)..tok.special(Special::EndOfText) + tokenizer::N_SPECIAL as u32,
 		}
-		let ids = tok.encode(text)?;
-		history.push(self.user);
-		history.extend(ids);
-		history.extend([self.end, self.assistant]);
-		Ok(())
 	}
 
-	// history の末尾に AI の返事を生成して書き足す。区切りの印のいずれかが出るか max_len 文字に達したら止め、
-	// どの場合も history の末尾を終わりの印にして、次の User の発言を続けられる形にする。
-	// 終わりの印以外の印（User や AI の発言の開始）は返事の中に置く位置が無いので、終わりの印に置き換える。
-	// on_char は返事の文字ごとに呼ばれ、印では呼ばれない
+	// User の発言を履歴に足し、続けて AI の発言の開始を置いて返事を生成できる状態にする。
+	// encode は特殊トークンを作らないので、発言の本文が会話の区切りになることはない
+	fn push_user(&self, tok: &Tokenizer, history: &mut Vec<u32>, text: &str) {
+		history.push(self.user);
+		history.extend(tok.encode(text));
+		history.extend([self.end, self.assistant]);
+	}
+
+	// history の末尾に AI の返事を生成して書き足す。特殊トークンのいずれかが出るか max_len トークンに達したら止め、
+	// どの場合も history の末尾を発言の終わりにして、次の User の発言を続けられる形にする。
+	// 発言の終わり以外の特殊トークン（User や AI の発言の開始、事前学習で各文書の前に置いた文書の区切り、予備）は
+	// 返事の中に置く位置が無いので、発言の終わりに置き換える。
+	// on_token は返事のトークンごとに呼ばれ、特殊トークンでは呼ばれない
 	#[allow(clippy::too_many_arguments)]
 	fn reply(
 		&self,
@@ -1442,11 +1410,11 @@ impl ChatIds {
 		block_size: usize,
 		rng: &mut StdRng,
 		dev: &Device,
-		mut on_char: impl FnMut(u32) -> Result<()>,
+		mut on_token: impl FnMut(u32) -> Result<()>,
 	) -> Result<()> {
-		// generate は直近 block_size 文字だけを文脈にするので、そのままでは文脈が発言の途中から始まることがある。
+		// generate は直近 block_size トークンだけを文脈にするので、そのままでは文脈が発言の途中から始まることがある。
 		// 文脈に収まる範囲で最も古い User の発言の開始位置より前を捨て、発言の境界から始まる文脈にする。
-		// 学習データでは User の発言の開始は前の発言の終わりの印の直後に置かれるので、窓に収まる場合はその終わりの印も残す。
+		// 学習データでは User の発言の開始は前の発言の終わりの直後に置かれるので、窓に収まる場合はその発言の終わりも残す。
 		// 収まる範囲に User の発言の開始が無い場合（最後の発言だけで block_size を超える）は、窓の先頭より前を捨てる。
 		// generate は窓より前を読まないので、残すと毎ターン履歴が伸びるだけになる
 		if history.len() > block_size {
@@ -1462,7 +1430,7 @@ impl ChatIds {
 			if self.is_marker(id) {
 				return Ok(ControlFlow::Break(()));
 			}
-			on_char(id)?;
+			on_token(id)?;
 			Ok(ControlFlow::Continue(()))
 		})?;
 		*history = out;
@@ -1474,7 +1442,7 @@ impl ChatIds {
 	}
 
 	fn is_marker(&self, id: u32) -> bool {
-		[self.user, self.assistant, self.end].contains(&id)
+		self.specials.contains(&id)
 	}
 }
 
@@ -1482,10 +1450,13 @@ fn io_err(e: std::io::Error) -> candle_core::Error {
 	candle_core::Error::Msg(e.to_string())
 }
 
-// 区切りの印は私用領域の文字で字形が無いので、端末には User: / AI: の表記で出す
-fn printable(tok: &Tokenizer, id: u32) -> String {
-	let c = tok.itos[id as usize];
-	chat::label(c).map_or_else(|| c.to_string(), str::to_string)
+// 生成したトークンを端末に書き出す文字列にする。名前付きの特殊トークンは User: / AI: などの表記に、予備の特殊トークンは名前にし、
+// その前に持ち越していた文字の途中のバイトを U+FFFD として書き出す
+fn printable(tok: &Tokenizer, dec: &mut StreamDecoder, id: u32) -> String {
+	match tok.special_index(id) {
+		Some(i) => dec.finish() + &chat::label(i).map_or_else(|| tok.decode(&[id]), str::to_string),
+		None => dec.push(tok.token_bytes(id)),
+	}
 }
 
 fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
@@ -1494,10 +1465,10 @@ fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
 		candle_core::bail!("temperature は 0 より大きい必要がある: {}", args.temperature);
 	}
 	let (model, cfg, tok) = load_model(&args.model, dev)?;
-	let start = match &args.prompt {
-		Some(p) => tok.encode(p)?,
-		None => vec![0],
-	};
+	// 学習データの各文書は文書の区切りの直後から始まるので、書き出しの前に区切りを置き、文書の冒頭として続きを生成させる
+	let prompt = args.prompt.as_deref().unwrap_or("");
+	let mut start = vec![tok.special(Special::EndOfText)];
+	start.extend(tok.encode(prompt));
 	let seed = args.seed.unwrap_or_else(rand::random);
 	// 出力を標準出力に流すので、同じ結果を再現するためのシードは標準エラーに出す
 	if args.seed.is_none() {
@@ -1506,10 +1477,9 @@ fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
 	let mut rng = StdRng::seed_from_u64(seed);
 
 	let mut stdout = std::io::stdout().lock();
-	for &id in &start {
-		write!(stdout, "{}", printable(&tok, id)).map_err(io_err)?;
-	}
+	write!(stdout, "{prompt}").map_err(io_err)?;
 	stdout.flush().map_err(io_err)?;
+	let mut dec = StreamDecoder::default();
 	generate(
 		&model,
 		&start,
@@ -1519,12 +1489,12 @@ fn generate_cmd(args: GenerateArgs, dev: &Device) -> Result<()> {
 		&mut rng,
 		dev,
 		|id| {
-			write!(stdout, "{}", printable(&tok, id)).map_err(io_err)?;
+			write!(stdout, "{}", printable(&tok, &mut dec, id)).map_err(io_err)?;
 			stdout.flush().map_err(io_err)?;
 			Ok(ControlFlow::Continue(()))
 		},
 	)?;
-	writeln!(stdout).map_err(io_err)?;
+	writeln!(stdout, "{}", dec.finish()).map_err(io_err)?;
 	Ok(())
 }
 
@@ -1534,15 +1504,15 @@ fn chat_cmd(args: ChatArgs, dev: &Device) -> Result<()> {
 		candle_core::bail!("temperature は 0 より大きい必要がある: {}", args.temperature);
 	}
 	let (model, cfg, tok) = load_model(&args.model, dev)?;
-	let ids = ChatIds::new(&tok, &args.model)?;
+	let ids = ChatIds::new(&tok);
 	let seed = args.seed.unwrap_or_else(rand::random);
 	if args.seed.is_none() {
 		eprintln!("seed: {seed}");
 	}
 	let mut rng = StdRng::seed_from_u64(seed);
-	// generate は直近の block_size 文字だけを文脈にするので、それより前の発言は返事に反映されない
+	// generate は直近の block_size トークンだけを文脈にするので、それより前の発言は返事に反映されない
 	eprintln!(
-		"/reset で会話を消去、/exit か空行で終了。返事の生成に使うのは直近の {} 文字まで",
+		"/reset で会話を消去、/exit か空行で終了。返事の生成に使うのは直近の {} トークンまで",
 		cfg.block_size
 	);
 
@@ -1570,14 +1540,10 @@ fn chat_cmd(args: ChatArgs, dev: &Device) -> Result<()> {
 			}
 			_ => {}
 		}
-		// 入力の誤りで対話を終了させないよう、エラーを表示して次の入力を待つ。
-		// 会話を標準出力から記録したときに本文と区別できるよう、エラーは標準エラーに出す
-		if let Err(e) = ids.push_user(&tok, &mut history, text) {
-			eprintln!("エラー: {e}");
-			continue;
-		}
+		ids.push_user(&tok, &mut history, text);
 		write!(stdout, "AI: ").map_err(io_err)?;
 		stdout.flush().map_err(io_err)?;
+		let mut dec = StreamDecoder::default();
 		ids.reply(
 			&model,
 			&mut history,
@@ -1587,22 +1553,119 @@ fn chat_cmd(args: ChatArgs, dev: &Device) -> Result<()> {
 			&mut rng,
 			dev,
 			|id| {
-				write!(stdout, "{}", printable(&tok, id)).map_err(io_err)?;
+				write!(stdout, "{}", printable(&tok, &mut dec, id)).map_err(io_err)?;
 				stdout.flush().map_err(io_err)
 			},
 		)?;
-		writeln!(stdout).map_err(io_err)?;
+		writeln!(stdout, "{}", dec.finish()).map_err(io_err)?;
 	}
+	Ok(())
+}
+
+// inputs を先頭から順に読み、本文の合計が limit バイトに達した時点で残りのファイルを読まずに止める
+fn load_sample(inputs: &[PathBuf], limit: usize) -> Result<Vec<corpus::Documents>> {
+	let mut out = Vec::new();
+	let mut total = 0;
+	for path in inputs {
+		if total >= limit {
+			break;
+		}
+		let mut docs = corpus::load_documents(path)?;
+		docs.truncate_bytes(limit - total);
+		total += docs.bytes();
+		out.push(docs);
+	}
+	Ok(out)
+}
+
+fn tokenizer_train(args: TokenizerTrainArgs) -> Result<()> {
+	if !(tokenizer::MIN_VOCAB..=tokenizer::MAX_VOCAB).contains(&args.vocab) {
+		candle_core::bail!(
+			"--vocab は {} 以上 {} 以下である必要がある: {}",
+			tokenizer::MIN_VOCAB,
+			tokenizer::MAX_VOCAB,
+			args.vocab
+		);
+	}
+	let t0 = Instant::now();
+	let sample = load_sample(&args.inputs, args.sample_mb.saturating_mul(1 << 20))?;
+	let docs: Vec<&str> = sample.iter().flat_map(|d| d.strs()).collect();
+	let bytes: usize = sample.iter().map(|d| d.bytes()).sum();
+	// 本文が無いとマージを 1 つも学習できないまま、バイトだけの語彙が正常終了で保存され、後続の train で原因の分からない結果になる。
+	// 本文があっても塊がすべて 1 バイトならマージは学習できず、その場合は下の「語彙 … で止めた」の表示だけで知らせる
+	if bytes == 0 {
+		candle_core::bail!("学習に使える本文が無い（文書が 0 件か、全文書が空）");
+	}
+	let counts = tokenizer::count_pieces(&docs);
+	eprintln!(
+		"documents: {} / {:.1} MB / distinct pieces: {} / {:.1}s",
+		docs.len(),
+		bytes as f64 / 1e6,
+		counts.len(),
+		t0.elapsed().as_secs_f32()
+	);
+	let tok = Tokenizer::train(&counts, args.vocab, |done, total| {
+		if done % 1000 == 0 || done == total {
+			eprintln!("merges: {done}/{total} | {:.1}s", t0.elapsed().as_secs_f32());
+		}
+	})?;
+	if tok.vocab_size() < args.vocab {
+		eprintln!(
+			"隣り合うペアが無くなったので、語彙 {} で止めた（指定は {}）",
+			tok.vocab_size(),
+			args.vocab
+		);
+	}
+	tok.save(&args.out)?;
+	// 学習に使った文書で測るので、未知の文章での圧縮率より高めに出る
+	let n_tokens = tok.encode_documents(&docs).len() - docs.len();
+	println!(
+		"vocab: {} / {:.2} bytes/token（学習に使った文書） / {}",
+		tok.vocab_size(),
+		bytes as f64 / n_tokens.max(1) as f64,
+		args.out.display()
+	);
+	Ok(())
+}
+
+fn tokenizer_encode(args: TokenizerEncodeArgs) -> Result<()> {
+	let tok = Tokenizer::load(&args.tokenizer)?;
+	let t0 = Instant::now();
+	let (mut ids, mut bytes, mut n_docs) = (Vec::new(), 0usize, 0usize);
+	// ファイルを 1 つずつ読んで encode し、テキストは次のファイルを読む前に手放す。同時にメモリに載るテキストは 1 ファイル分になる
+	for path in &args.inputs {
+		let docs = corpus::load_documents(path)?;
+		bytes += docs.bytes();
+		n_docs += docs.len();
+		ids.extend(tok.encode_documents(&docs.strs()));
+	}
+	corpus::write_bin(&args.out, &tok, &ids)?;
+	let secs = t0.elapsed().as_secs_f64();
+	// 文書の区切りは本文のバイトを持たないので、bytes/token の分母から除く
+	println!(
+		"documents: {n_docs} / tokens: {} / {:.2} bytes/token / {:.1} MB/s / {}",
+		ids.len(),
+		bytes as f64 / (ids.len() - n_docs).max(1) as f64,
+		bytes as f64 / 1e6 / secs.max(1e-9),
+		args.out.display()
+	);
 	Ok(())
 }
 
 fn main() -> Result<()> {
 	let cli = Cli::parse();
+	// トークナイザーの処理は GPU を使わないので、デバイスを確保しない
+	let cmd = match cli.command {
+		Command::Tokenizer(TokenizerCommand::Train(args)) => return tokenizer_train(args),
+		Command::Tokenizer(TokenizerCommand::Encode(args)) => return tokenizer_encode(args),
+		cmd => cmd,
+	};
 	let dev = select_device(cli.cpu)?;
-	match cli.command {
+	match cmd {
 		Command::Train(args) => train(args, &dev),
 		Command::Finetune(args) => finetune(args, &dev),
 		Command::Generate(args) => generate_cmd(args, &dev),
 		Command::Chat(args) => chat_cmd(args, &dev),
+		Command::Tokenizer(_) => unreachable!("トークナイザーのサブコマンドは上で処理した"),
 	}
 }

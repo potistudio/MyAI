@@ -1,21 +1,18 @@
-//! 対話形式の学習データと、会話を 1 本の文字列に並べる書式。
+//! 対話形式の学習データと、会話を 1 本の ID 列に並べる書式。
 //!
-//! 会話は発言ごとに「役割の印 + 本文 + 終わりの印」を並べた 1 本の文字列にする:
-//!   [USER]Hi![END][ASSISTANT]Hello! How can I help you today?[END][USER]...
-//! 印は Unicode の私用領域の文字で、通常の文章には現れない。
-//! そのため 1 組の重みのまま、印を含む入力には AI の発言として返事を書かせられる。
-//! 印を含まない入力で事前学習と同じ文章の続きを書く力は、finetune で文章コーパスを混ぜた（--mix）場合に保たれる。
-//! chat サブコマンドは [ASSISTANT] の後ろを生成し、[END] が出た時点で生成を止める。
+//! 会話は発言ごとに「役割の特殊トークン + 本文 + 発言の終わりの特殊トークン」を並べた 1 本の ID 列にする:
+//!   <|user|>Hi!<|end|><|assistant|>Hello! How can I help you today?<|end|><|user|>...
+//! 特殊トークンはテキストの encode からは生成されないので、本文や利用者の入力が発言の境界を作ることはない。
+//! そのため 1 組の重みのまま、特殊トークンを含む入力には AI の発言として返事を書かせられる。
+//! 特殊トークンを含まない入力で事前学習と同じ文章の続きを書く力は、finetune で文章コーパスを混ぜた（--mix）場合に保たれる。
+//! chat サブコマンドは <|assistant|> の後ろを生成し、<|end|> が出た時点で生成を止める。
 
 use std::path::Path;
 
 use candle_core::Result;
 use serde::Deserialize;
 
-pub const USER: char = '\u{E000}';
-pub const ASSISTANT: char = '\u{E001}';
-pub const END: char = '\u{E002}';
-pub const MARKERS: [char; 3] = [USER, ASSISTANT, END];
+use crate::tokenizer::{Special, Tokenizer};
 
 #[derive(Deserialize)]
 pub struct Conversation {
@@ -36,16 +33,15 @@ pub enum Role {
 }
 
 impl Role {
-	fn marker(self) -> char {
+	fn special(self) -> Special {
 		match self {
-			Role::User => USER,
-			Role::Assistant => ASSISTANT,
+			Role::User => Special::User,
+			Role::Assistant => Special::Assistant,
 		}
 	}
 }
 
-/// 1 行 1 会話の JSONL を読む。形式は {"messages": [{"role": "user" | "assistant", "content": "..."}, ...]}。
-/// 本文に印の文字があると発言の境界が本文の途中に生じるので、その会話を含むファイルはエラーにする
+/// 1 行 1 会話の JSONL を読む。形式は {"messages": [{"role": "user" | "assistant", "content": "..."}, ...]}
 pub fn load_jsonl(path: &Path) -> Result<Vec<Conversation>> {
 	let text =
 		std::fs::read_to_string(path).map_err(|e| candle_core::Error::Msg(format!("{}: {e}", path.display())))?;
@@ -60,9 +56,6 @@ pub fn load_jsonl(path: &Path) -> Result<Vec<Conversation>> {
 		if conv.messages.is_empty() {
 			candle_core::bail!("{}: messages が空", at());
 		}
-		if conv.messages.iter().any(|m| m.content.contains(MARKERS)) {
-			candle_core::bail!("{}: 本文に会話の区切り用の文字（U+E000〜U+E002）が含まれる", at());
-		}
 		convs.push(conv);
 	}
 	if convs.is_empty() {
@@ -71,46 +64,49 @@ pub fn load_jsonl(path: &Path) -> Result<Vec<Conversation>> {
 	Ok(convs)
 }
 
-/// 会話を並べた 1 本の文字列と、各文字を loss に数えるかどうかの列（文字数と同じ長さ）を返す。
-/// 数えるのは AI の発言の本文とその直後の [END]。[END] を数えることで、返事を終える位置も学習させる。
-/// User の発言と役割の印は文脈として入力するだけで、loss には数えない。
+/// 会話を並べた 1 本の ID 列と、各トークンを loss に数えるかどうかの列（ID 列と同じ長さ）を返す。
+/// 数えるのは AI の発言の本文とその直後の <|end|>。<|end|> を数えることで、返事を終える位置も学習させる。
+/// User の発言と役割の特殊トークンは文脈として入力するだけで、loss には数えない。
 /// 数えると、chat の推論時には入力として与えられる User の発言を生成する重みの更新に、学習の一部が使われる
-pub fn render(convs: &[Conversation]) -> (String, Vec<bool>) {
-	let mut text = String::new();
+pub fn render(tok: &Tokenizer, convs: &[Conversation]) -> (Vec<u16>, Vec<bool>) {
+	let mut ids = Vec::new();
 	let mut mask = Vec::new();
-	let mut push = |c: char, counted: bool| {
-		text.push(c);
+	// 語彙は u16 に収まる大きさに制限されているので、ID は u16 に変換できる
+	let mut push = |id: u32, counted: bool| {
+		ids.push(id as u16);
 		mask.push(counted);
 	};
+	let end = tok.special(Special::End);
 	for conv in convs {
 		for m in &conv.messages {
 			let counted = m.role == Role::Assistant;
-			push(m.role.marker(), false);
-			for c in m.content.chars() {
-				push(c, counted);
+			push(tok.special(m.role.special()), false);
+			for id in tok.encode(&m.content) {
+				push(id, counted);
 			}
-			push(END, counted);
+			push(end, counted);
 		}
 	}
-	(text, mask)
+	(ids, mask)
 }
 
-/// 端末に出力するときの印の表記。私用領域の文字は多くのフォントで字形が無く、表示されないか豆腐になる
-pub fn label(c: char) -> Option<&'static str> {
-	match c {
-		USER => Some("\nUser: "),
-		ASSISTANT => Some("\nAI: "),
-		END => Some("\n"),
-		_ => None,
-	}
+/// 端末に出力するときの名前付きの特殊トークンの表記。index は特殊トークンの枠の中での番号で、予備の枠は None
+pub fn label(index: usize) -> Option<&'static str> {
+	Some(match Special::from_index(index)? {
+		Special::User => "\nUser: ",
+		Special::Assistant => "\nAI: ",
+		Special::End => "\n",
+		Special::EndOfText => "\n<|endoftext|>\n",
+	})
 }
 
-/// 1 文字を 1 マスに描く表示（viz）での印の表記
-pub fn symbol(c: char) -> Option<char> {
-	match c {
-		USER => Some('▷'),
-		ASSISTANT => Some('▶'),
-		END => Some('■'),
-		_ => None,
+/// 1 文字を 1 マスに描く表示（viz）での特殊トークンの表記
+pub fn symbol(index: usize) -> char {
+	match Special::from_index(index) {
+		Some(Special::User) => '▷',
+		Some(Special::Assistant) => '▶',
+		Some(Special::End) => '■',
+		Some(Special::EndOfText) => '¶',
+		None => '◇',
 	}
 }
